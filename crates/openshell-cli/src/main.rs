@@ -490,13 +490,13 @@ enum Commands {
         #[arg(long, short, num_args = 1..)]
         port: Vec<String>,
 
-        /// Number of virtual CPUs.
-        #[arg(long, default_value_t = 2)]
-        vcpus: u8,
+        /// Number of virtual CPUs (default: 4 for gateway, 2 for --exec).
+        #[arg(long)]
+        vcpus: Option<u8>,
 
-        /// RAM in MiB.
-        #[arg(long, default_value_t = 2048)]
-        mem: u32,
+        /// RAM in MiB (default: 8192 for gateway, 2048 for --exec).
+        #[arg(long)]
+        mem: Option<u32>,
 
         /// libkrun log level (0=Off .. 5=Trace).
         #[arg(long, default_value_t = 1)]
@@ -2234,8 +2234,8 @@ async fn main() -> Result<()> {
             let mut config = if let Some(exec_path) = exec {
                 openshell_vm::VmConfig {
                     rootfs,
-                    vcpus,
-                    mem_mib: mem,
+                    vcpus: vcpus.unwrap_or(2),
+                    mem_mib: mem.unwrap_or(2048),
                     exec_path,
                     args,
                     env,
@@ -2250,8 +2250,12 @@ async fn main() -> Result<()> {
                 if !port.is_empty() {
                     c.port_map = port;
                 }
-                c.vcpus = vcpus;
-                c.mem_mib = mem;
+                if let Some(v) = vcpus {
+                    c.vcpus = v;
+                }
+                if let Some(m) = mem {
+                    c.mem_mib = m;
+                }
                 c.net = net_backend;
                 c
             };
