@@ -411,42 +411,56 @@
 <section class="tex2jax_ignore mathjax_ignore" id="about-inference-routing">
 <h1>About Inference Routing<a class="headerlink" href="#about-inference-routing" title="Link to this heading">#</a></h1>
 <p>OpenShell handles inference in two ways:</p>
-<ul class="simple">
-<li><p>External inference endpoints are controlled by sandbox <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>.</p></li>
-<li><p>Each sandbox also exposes <code class="docutils literal notranslate"><span class="pre">https://inference.local</span></code>, a special endpoint for
-inference that should stay local to the host for privacy and security.</p></li>
-</ul>
-<section id="external-inference">
-<h2>External Inference<a class="headerlink" href="#external-inference" title="Link to this heading">#</a></h2>
-<p>If sandbox code calls an external inference API like <code class="docutils literal notranslate"><span class="pre">api.openai.com</span></code> or
-<code class="docutils literal notranslate"><span class="pre">api.anthropic.com</span></code>, that traffic is treated like any other outbound network
-request. It is allowed or denied by <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>.</p>
-<p>Refer to <a class="reference internal" href="../sandboxes/policies.html"><span class="doc">Customize Sandbox Policies</span></a> and the
-<a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>
-section for details.</p>
-</section>
-<section id="inference-local">
-<h2><code class="docutils literal notranslate"><span class="pre">inference.local</span></code><a class="headerlink" href="#inference-local" title="Link to this heading">#</a></h2>
-<p>Every sandbox also exposes a special endpoint: <code class="docutils literal notranslate"><span class="pre">https://inference.local</span></code>.</p>
-<p>This endpoint exists so inference can be routed to a model running locally on
-the same host. In the future, it can also route to a model managed by the
-cluster. It is the special case for inference that should stay local for
-privacy and security reasons.</p>
-</section>
-<section id="using-inference-local">
-<h2>Using <code class="docutils literal notranslate"><span class="pre">inference.local</span></code><a class="headerlink" href="#using-inference-local" title="Link to this heading">#</a></h2>
-<p>When code inside a sandbox calls <code class="docutils literal notranslate"><span class="pre">https://inference.local</span></code>, the <a class="reference internal" href="../about/architecture.html"><span class="doc">privacy router</span></a> routes the
-request to the configured backend for that gateway.</p>
-<p>The configured model is applied to generation requests, and provider
-credentials are supplied by OpenShell rather than by code inside the sandbox.</p>
-<p>If code calls an external inference host directly, that traffic is evaluated
-only by <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Path</p></th>
+<th class="head"><p>How It Works</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>External endpoints</strong></p></td>
+<td><p>Traffic to hosts like <code class="docutils literal notranslate"><span class="pre">api.openai.com</span></code> or <code class="docutils literal notranslate"><span class="pre">api.anthropic.com</span></code> is treated like any other outbound request — allowed or denied by <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>. See <a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong><code class="docutils literal notranslate"><span class="pre">inference.local</span></code></strong></p></td>
+<td><p>A special endpoint exposed inside every sandbox for inference that should stay local to the host for privacy and security. The <a class="reference internal" href="../about/architecture.html"><span class="doc">privacy router</span></a> strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<section id="how-inference-local-works">
+<h2>How <code class="docutils literal notranslate"><span class="pre">inference.local</span></code> Works<a class="headerlink" href="#how-inference-local-works" title="Link to this heading">#</a></h2>
+<p>When code inside a sandbox calls <code class="docutils literal notranslate"><span class="pre">https://inference.local</span></code>, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, and provider credentials are supplied by OpenShell rather than by code inside the sandbox.</p>
+<p>If code calls an external inference host directly, that traffic is evaluated only by <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Property</p></th>
+<th class="head"><p>Detail</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Credentials</p></td>
+<td><p>No sandbox API keys needed — credentials come from the configured provider record.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Configuration</p></td>
+<td><p>One provider and one model define sandbox inference.</p></td>
+</tr>
+<tr class="row-even"><td><p>Provider support</p></td>
+<td><p>OpenAI, Anthropic, and NVIDIA providers all work through the same endpoint.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Hot-refresh</p></td>
+<td><p>Provider credential changes and inference updates are picked up without recreating sandboxes.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
 </section>
 <section id="supported-api-patterns">
 <h2>Supported API Patterns<a class="headerlink" href="#supported-api-patterns" title="Link to this heading">#</a></h2>
-<p>Supported request patterns depend on the provider configured for
-<code class="docutils literal notranslate"><span class="pre">inference.local</span></code>.</p>
-<p>For OpenAI-compatible providers, these patterns are supported:</p>
+<p>Supported request patterns depend on the provider configured for <code class="docutils literal notranslate"><span class="pre">inference.local</span></code>.</p>
+<div class="sd-tab-set docutils">
+<input checked="checked" id="sd-tab-item-0" name="sd-tab-set-0" type="radio">
+<label class="sd-tab-label" for="sd-tab-item-0">
+OpenAI-compatible</label><div class="sd-tab-content docutils">
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Pattern</p></th>
@@ -455,15 +469,15 @@ only by <code class="docutils literal notranslate"><span class="pre">network_pol
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>OpenAI Chat Completions</p></td>
+<tr class="row-even"><td><p>Chat Completions</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p>OpenAI Completions</p></td>
+<tr class="row-odd"><td><p>Completions</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/v1/completions</span></code></p></td>
 </tr>
-<tr class="row-even"><td><p>OpenAI Responses</p></td>
+<tr class="row-even"><td><p>Responses</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/v1/responses</span></code></p></td>
 </tr>
@@ -478,7 +492,10 @@ only by <code class="docutils literal notranslate"><span class="pre">network_pol
 </tbody>
 </table>
 </div>
-<p>For Anthropic-compatible providers, this pattern is supported:</p>
+</div>
+<input id="sd-tab-item-1" name="sd-tab-set-0" type="radio">
+<label class="sd-tab-label" for="sd-tab-item-1">
+Anthropic-compatible</label><div class="sd-tab-content docutils">
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head"><p>Pattern</p></th>
@@ -487,36 +504,22 @@ only by <code class="docutils literal notranslate"><span class="pre">network_pol
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>Anthropic Messages</p></td>
+<tr class="row-even"><td><p>Messages</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">POST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">/v1/messages</span></code></p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>Requests to <code class="docutils literal notranslate"><span class="pre">inference.local</span></code> that do not match the configured provider’s
-supported patterns are denied.</p>
-</section>
-<section id="key-properties">
-<h2>Key Properties<a class="headerlink" href="#key-properties" title="Link to this heading">#</a></h2>
-<ul class="simple">
-<li><p>External endpoints use <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>.</p></li>
-<li><p>Explicit local endpoint: special local routing happens through
-<code class="docutils literal notranslate"><span class="pre">inference.local</span></code>.</p></li>
-<li><p>No sandbox API keys: credentials come from the configured provider record.</p></li>
-<li><p>Single managed config: one provider and one model define sandbox inference.</p></li>
-<li><p>Provider-agnostic: OpenAI, Anthropic, and NVIDIA providers all work through
-the same endpoint.</p></li>
-<li><p>Hot-refresh: provider credential changes and inference updates are picked up
-without recreating sandboxes.</p></li>
-</ul>
+</div>
+</div>
+<p>Requests to <code class="docutils literal notranslate"><span class="pre">inference.local</span></code> that do not match the configured provider’s supported patterns are denied.</p>
 </section>
 <section id="next-steps">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="configure.html"><span class="doc">Configure Inference Routing</span></a>: configure the backend behind <code class="docutils literal notranslate"><span class="pre">inference.local</span></code>.</p></li>
-<li><p><a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>:
-understand how external endpoints are controlled.</p></li>
+<li><p><strong>Ready to configure?</strong> Set up the backend behind <code class="docutils literal notranslate"><span class="pre">inference.local</span></code> in <a class="reference internal" href="configure.html"><span class="doc">Configure Inference Routing</span></a>.</p></li>
+<li><p><strong>Need to control external endpoints?</strong> See <a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>.</p></li>
 </ul>
 </section>
 </section>
@@ -570,11 +573,8 @@ understand how external endpoints are controlled.</p></li>
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#external-inference">External Inference</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#inference-local"><code class="docutils literal notranslate"><span class="pre">inference.local</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#using-inference-local">Using <code class="docutils literal notranslate"><span class="pre">inference.local</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#how-inference-local-works">How <code class="docutils literal notranslate"><span class="pre">inference.local</span></code> Works</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-api-patterns">Supported API Patterns</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-properties">Key Properties</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
 </ul>
   </nav></div>
