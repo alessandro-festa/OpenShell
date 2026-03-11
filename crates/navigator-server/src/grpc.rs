@@ -968,7 +968,7 @@ impl Navigator for NavigatorService {
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
-        let new_policy = req
+        let mut new_policy = req
             .policy
             .ok_or_else(|| Status::invalid_argument("policy is required"))?;
 
@@ -988,6 +988,18 @@ impl Navigator for NavigatorService {
             .spec
             .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+
+        // When a sandbox was created with a custom image, the CLI clears the
+        // process identity (run_as_user / run_as_group) at creation time
+        // because the image may lack the default "sandbox" user/group.  If the
+        // baseline has a cleared process identity, normalise the incoming
+        // policy to match so that users don't have to manually strip those
+        // fields from their YAML.
+        if let Some(ref baseline_process) = spec.policy.as_ref().and_then(|p| p.process.as_ref()) {
+            if baseline_process.run_as_user.is_empty() && baseline_process.run_as_group.is_empty() {
+                navigator_policy::clear_process_identity(&mut new_policy);
+            }
+        }
 
         if let Some(baseline_policy) = spec.policy.as_ref() {
             // Validate static fields haven't changed.
@@ -3174,6 +3186,59 @@ mod tests {
         let result = validate_static_fields_unchanged(&baseline, &changed);
         assert!(result.is_err());
         assert!(result.unwrap_err().message().contains("include_workdir"));
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_process_identity_change() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{ProcessPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        // Baseline has cleared process identity (custom image scenario).
+        let baseline = ProtoSandboxPolicy {
+            process: Some(ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+        // New policy sets run_as_user/group — should be rejected since process
+        // is a static field.  The caller (update_sandbox_policy) normalises
+        // the incoming policy for custom-image sandboxes *before* reaching
+        // this validation.
+        let with_identity = ProtoSandboxPolicy {
+            process: Some(ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "sandbox".into(),
+            }),
+            ..Default::default()
+        };
+        let result = validate_static_fields_unchanged(&baseline, &with_identity);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("process"));
+    }
+
+    #[test]
+    fn validate_static_fields_allows_cleared_process_identity() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{ProcessPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        // After normalisation, both baseline and new policy have cleared
+        // process identity — should pass.
+        let baseline = ProtoSandboxPolicy {
+            process: Some(ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+        let normalised = ProtoSandboxPolicy {
+            process: Some(ProcessPolicy {
+                run_as_user: String::new(),
+                run_as_group: String::new(),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_static_fields_unchanged(&baseline, &normalised).is_ok());
     }
 
     #[test]
