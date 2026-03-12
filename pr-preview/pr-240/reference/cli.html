@@ -387,7 +387,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get-started/quickstart.html">Quickstart</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../tutorials/github-sandbox.html">GitHub Policy Iteration Tutorial</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tutorials/github-sandbox.html">GitHub Policy Tutorial</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Sandboxes</span></p>
 <ul class="nav bd-sidenav">
@@ -487,7 +487,6 @@
 │   ├── destroy
 │   ├── info
 │   ├── add &lt;url&gt;
-│   ├── tunnel
 │   └── select [name]
 ├── sandbox
 │   ├── create
@@ -512,6 +511,9 @@
 │   ├── set
 │   ├── update
 │   └── get
+├── doctor
+│   ├── logs
+│   └── exec
 └── completions &lt;shell&gt;
 </pre></div>
 </div>
@@ -569,14 +571,31 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">gateway</span> <span class="pre">add</span> <span class="pre">&lt;url&gt;</span></code></p></td>
 <td><p>Register an existing remote gateway by URL.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">gateway</span> <span class="pre">tunnel</span></code></p></td>
-<td><p>Set up a kubectl tunnel to a remote cluster.</p></td>
-</tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">gateway</span> <span class="pre">select</span> <span class="pre">&lt;name&gt;</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">gateway</span> <span class="pre">select</span> <span class="pre">&lt;name&gt;</span></code></p></td>
 <td><p>Set the active cluster. All subsequent commands target this cluster.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">gateway</span> <span class="pre">select</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">gateway</span> <span class="pre">select</span></code></p></td>
 <td><p>List all registered clusters (when called without a name).</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="diagnostic-commands">
+<h2>Diagnostic Commands<a class="headerlink" href="#diagnostic-commands" title="Link to this heading">#</a></h2>
+<p>Troubleshoot gateway issues.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Command</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">doctor</span> <span class="pre">logs</span></code></p></td>
+<td><p>Fetch logs from the gateway Docker container. Use <code class="docutils literal notranslate"><span class="pre">--tail</span></code> for streaming, <code class="docutils literal notranslate"><span class="pre">-n</span></code> to limit line count.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">doctor</span> <span class="pre">exec</span> <span class="pre">--</span> <span class="pre">&lt;command&gt;</span></code></p></td>
+<td><p>Run a command inside the gateway container (e.g., <code class="docutils literal notranslate"><span class="pre">kubectl</span> <span class="pre">get</span> <span class="pre">pods</span> <span class="pre">-A</span></code>, <code class="docutils literal notranslate"><span class="pre">k9s</span></code>, <code class="docutils literal notranslate"><span class="pre">sh</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -912,6 +931,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#command-tree">Command Tree</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#status-logs-and-terminal">Status, Logs, and Terminal</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gateway-commands">Gateway Commands</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#diagnostic-commands">Diagnostic Commands</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sandbox-commands">Sandbox Commands</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sandbox-create-flags">Sandbox Create Flags</a></li>
 </ul>

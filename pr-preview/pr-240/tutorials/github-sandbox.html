@@ -387,7 +387,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get-started/quickstart.html">Quickstart</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">GitHub Policy Iteration Tutorial</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">GitHub Policy Tutorial</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Sandboxes</span></p>
 <ul class="nav bd-sidenav">
@@ -470,7 +470,7 @@
 <section class="tex2jax_ignore mathjax_ignore" id="set-up-a-sandbox-of-claude-code-with-a-custom-github-policy">
 <h1>Set Up a Sandbox of Claude Code with a Custom GitHub Policy<a class="headerlink" href="#set-up-a-sandbox-of-claude-code-with-a-custom-github-policy" title="Link to this heading">#</a></h1>
 <p>This tutorial walks through an iterative sandbox policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, and observe the default network policy denying the request.
-You then diagnose the denial from your machine and from inside the sandbox, apply a custom policy, and verify that the policy update takes effect.</p>
+You then diagnose the denial from your machine and from inside the sandbox, apply a policy update, and verify that the policy update to the sandbox takes effect.</p>
 <p>After completing this tutorial, you will have:</p>
 <ul class="simple">
 <li><p>A running sandbox with Claude Code that can push to a GitHub repository.</p></li>
@@ -492,19 +492,19 @@ You then diagnose the denial from your machine and from inside the sandbox, appl
 </ul>
 <p>This tutorial uses two terminals to demonstrate the iterative policy workflow:</p>
 <ul class="simple">
-<li><p><strong>Terminal 1</strong>: The sandbox terminal. You create the sandbox here with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">create</span></code> and interact with Claude Code inside it.</p></li>
-<li><p><strong>Terminal 2</strong>: A terminal outside the sandbox on your machine. You use this for viewing the sandbox logs with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">term</span></code> and applying an updated policy with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">policy</span> <span class="pre">set</span></code>.</p></li>
+<li><p><strong>Terminal 1</strong>: The sandbox terminal. You create the sandbox in this terminal by running <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">create</span></code> and interact with Claude Code inside it.</p></li>
+<li><p><strong>Terminal 2</strong>: A terminal outside the sandbox on your machine. You use this terminal for viewing the sandbox logs with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">term</span></code> and applying an updated policy with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">policy</span> <span class="pre">set</span></code>.</p></li>
 </ul>
 <p>Each section below indicates which terminal to use.</p>
 </section>
 <section id="set-up-a-sandbox-with-your-github-token">
-<h2>Set up a Sandbox with Your GitHub Token<a class="headerlink" href="#set-up-a-sandbox-with-your-github-token" title="Link to this heading">#</a></h2>
-<p>Depending on whether you are starting a new sandbox or using an existing one, choose the appropriate tab and follow the instructions.</p>
+<h2>Set Up a Sandbox with Your GitHub Token<a class="headerlink" href="#set-up-a-sandbox-with-your-github-token" title="Link to this heading">#</a></h2>
+<p>Depending on whether you start a new sandbox or use an existing sandbox, choose the appropriate tab and follow the instructions.</p>
 <div class="sd-tab-set docutils">
 <input checked="checked" id="sd-tab-item-0" name="sd-tab-set-0" type="radio">
 <label class="sd-tab-label" for="sd-tab-item-0">
 Starting a new sandbox</label><div class="sd-tab-content docutils">
-<p>In terminal 1, create a new sandbox with Claude Code. The <a class="reference internal" href="../reference/default-policy.html"><span class="doc">default policy</span></a> is applied automatically, which allows read-only access to GitHub.</p>
+<p>In terminal 2, create a new sandbox with Claude Code. The <a class="reference internal" href="../reference/default-policy.html"><span class="doc">default policy</span></a> is applied automatically, which allows read-only access to GitHub.</p>
 <p>Create a <a class="reference internal" href="../sandboxes/providers.html"><span class="doc">credential provider</span></a> that injects your GitHub token into the sandbox automatically. The provider reads <code class="docutils literal notranslate"><span class="pre">GITHUB_TOKEN</span></code> from your host environment and sets it as an environment variable inside the sandbox:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nv">GITHUB_TOKEN</span><span class="o">=</span>&lt;your-token&gt;
 <span class="gp">$ </span>openshell<span class="w"> </span>provider<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>my-github<span class="w"> </span>--type<span class="w"> </span>github<span class="w"> </span>--from-existing
@@ -517,12 +517,12 @@ Starting a new sandbox</label><div class="sd-tab-content docutils">
 <input id="sd-tab-item-1" name="sd-tab-set-0" type="radio">
 <label class="sd-tab-label" for="sd-tab-item-1">
 Using an existing sandbox</label><div class="sd-tab-content docutils">
-<p>Connect to a sandbox that is already running and set your GitHub token as an environment variable:</p>
+<p>In terminal 1, connect to a sandbox that is already running and set your GitHub token as an environment variable:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>connect<span class="w"> </span>&lt;sandbox-name&gt;
 <span class="gp">$ </span><span class="nb">export</span><span class="w"> </span><span class="nv">GITHUB_TOKEN</span><span class="o">=</span>&lt;your-token&gt;
 </pre></div>
 </div>
-<p>To find the name of running sandboxes, run <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">list</span></code>.</p>
+<p>To find the name of running sandboxes, run <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">list</span></code> in terminal 2.</p>
 </div>
 </div>
 </section>
@@ -535,7 +535,7 @@ Using an existing sandbox</label><div class="sd-tab-content docutils">
 <p class="sd-card-text">Write a <code class="docutils literal notranslate"><span class="pre">hello_world.py</span></code> script and push it to <code class="docutils literal notranslate"><span class="pre">https://github.com/&lt;org&gt;/&lt;repo&gt;</span></code>.</p>
 </div>
 </details><p>Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.</p>
-<p>The push should fail. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub and blocks write operations, so the proxy denies the push before the request reaches the GitHub server.</p>
+<p>The push fails. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub and blocks write operations, so the proxy denies the push before the request reaches the GitHub server.</p>
 </section>
 <section id="diagnose-the-denial">
 <h2>Diagnose the Denial<a class="headerlink" href="#diagnose-the-denial" title="Link to this heading">#</a></h2>
@@ -559,8 +559,8 @@ l7_deny_reason: PUT /repos/&lt;org&gt;/&lt;repo&gt;/contents/hello_world.py not 
 </div>
 <p>The log shows that the sandbox proxy intercepted an outbound <code class="docutils literal notranslate"><span class="pre">PUT</span></code> request to <code class="docutils literal notranslate"><span class="pre">api.github.com</span></code> and denied it. The <code class="docutils literal notranslate"><span class="pre">github_rest_api</span></code> policy allows read operations (GET) but blocks write operations (PUT, POST, DELETE) to the GitHub API. A similar denial appears for <code class="docutils literal notranslate"><span class="pre">github.com</span></code> if Claude attempted a git push over HTTPS.</p>
 </section>
-<section id="ask-claude-to-check-the-sandbox-logs">
-<h3>Ask Claude to Check the Sandbox Logs<a class="headerlink" href="#ask-claude-to-check-the-sandbox-logs" title="Link to this heading">#</a></h3>
+<section id="ask-claude-code-to-check-the-sandbox-logs">
+<h3>Ask Claude Code to Check the Sandbox Logs<a class="headerlink" href="#ask-claude-code-to-check-the-sandbox-logs" title="Link to this heading">#</a></h3>
 <p>In terminal 1, ask Claude Code to check the sandbox logs for denied requests:</p>
 <details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3" open="open">
 <summary class="sd-summary-title sd-card-header">
@@ -581,13 +581,25 @@ will be blocked until the policy is updated.</p>
 <p>Copy the deny reason from Claude’s response. You paste it into an agent running on your machine in the next step.</p>
 </section>
 </section>
-<section id="update-the-policy-from-your-laptop">
-<h2>Update the Policy from Your Laptop<a class="headerlink" href="#update-the-policy-from-your-laptop" title="Link to this heading">#</a></h2>
-<p>In terminal 2, paste the deny reason from the previous step into your coding agent, such as Claude Code or Cursor, and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.</p>
-<ol class="arabic">
+<section id="update-the-policy-from-your-machine">
+<h2>Update the Policy from Your Machine<a class="headerlink" href="#update-the-policy-from-your-machine" title="Link to this heading">#</a></h2>
+<p>In terminal 2, paste the deny reason from the previous step into your coding agent on your machine, such as Claude Code or Cursor, and ask it to recommend a policy update. The deny reason gives the agent the context it needs to generate the correct policy rules. After pasting the following prompt sample, properly provide the GitHub organization and repository names of the repository you are pushing to.</p>
+<details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3" open="open">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-icon"><svg version="1.1" width="1.0em" height="1.0em" class="sd-octicon sd-octicon-terminal" viewBox="0 0 16 16" aria-hidden="true"><path d="M0 2.75C0 1.784.784 1 1.75 1h12.5c.966 0 1.75.784 1.75 1.75v10.5A1.75 1.75 0 0 1 14.25 15H1.75A1.75 1.75 0 0 1 0 13.25Zm1.75-.25a.25.25 0 0 0-.25.25v10.5c0 .138.112.25.25.25h12.5a.25.25 0 0 0 .25-.25V2.75a.25.25 0 0 0-.25-.25ZM7.25 8a.749.749 0 0 1-.22.53l-2.25 2.25a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734L5.44 8 3.72 6.28a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215l2.25 2.25c.141.14.22.331.22.53Zm1.5 1.5h3a.75.75 0 0 1 0 1.5h-3a.75.75 0 0 1 0-1.5Z"></path></svg></span><span class="sd-summary-text">Prompt</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<p class="sd-card-text">Based on the following deny reasons, recommend a sandbox policy update that allows GitHub pushes to <code class="docutils literal notranslate"><span class="pre">https://github.com/&lt;org&gt;/&lt;repo&gt;</span></code>, and save to <code class="docutils literal notranslate"><span class="pre">/tmp/sandbox-policy-update.yaml</span></code>:</p>
+<p class="sd-card-text">The <code class="docutils literal notranslate"><span class="pre">filesystem_policy</span></code>, <code class="docutils literal notranslate"><span class="pre">landlock</span></code>, and <code class="docutils literal notranslate"><span class="pre">process</span></code> sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the <code class="docutils literal notranslate"><span class="pre">network_policies</span></code> section takes effect when you apply this to a running sandbox.</p>
+</div>
+</details><p>The following steps outline the expected process done by the agent:</p>
+<ol class="arabic simple">
 <li><p>Inspects the deny reasons.</p></li>
 <li><p>Writes an updated policy that adds <code class="docutils literal notranslate"><span class="pre">github_git</span></code> and <code class="docutils literal notranslate"><span class="pre">github_api</span></code> blocks that grant write access to your repository.</p></li>
-<li><p>Saves the policy to a file, such as <code class="docutils literal notranslate"><span class="pre">/tmp/sandbox-policy-update.yaml</span></code>. Refer to the following policy example to compare with the policy the agent generated.</p>
+<li><p>Saves the policy to <code class="docutils literal notranslate"><span class="pre">/tmp/sandbox-policy-update.yaml</span></code>.</p></li>
+</ol>
+</section>
+<section id="review-the-generated-policy">
+<h2>Review the Generated Policy<a class="headerlink" href="#review-the-generated-policy" title="Link to this heading">#</a></h2>
+<p>Refer to the following policy example to compare with the generated policy before applying it. Confirm that the policy grants only the access you expect. In this case, <code class="docutils literal notranslate"><span class="pre">git</span> <span class="pre">push</span></code> operations and GitHub REST API access scoped to a single repository.</p>
 <details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
 <summary class="sd-summary-title sd-card-header">
 <span class="sd-summary-icon"><svg version="1.1" width="1.0em" height="1.0em" class="sd-octicon sd-octicon-code" viewBox="0 0 16 16" aria-hidden="true"><path d="m11.28 3.22 4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.749.749 0 0 1-1.275-.326.749.749 0 0 1 .215-.734L13.94 8l-3.72-3.72a.749.749 0 0 1 .326-1.275.749.749 0 0 1 .734.215Zm-6.56 0a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L2.06 8l3.72 3.72a.749.749 0 0 1-.326 1.275.749.749 0 0 1-.734-.215L.47 8.53a.75.75 0 0 1 0-1.06Z"></path></svg></span><span class="sd-summary-text">Full reference policy</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
@@ -646,54 +658,54 @@ will be blocked until the policy is updated.</p>
 <span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/bin/bash</span><span class="w"> </span><span class="p p-Indicator">}</span>
 <span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/opencode</span><span class="w"> </span><span class="p p-Indicator">}</span>
 
-<span class="w">  </span><span class="c1"># ── GitHub: git operations (clone, fetch, push) ──────────────</span>
-
-<span class="w">  </span><span class="nt">github_git</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-git</span>
-<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github.com</span>
-<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
-<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
-<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
-<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
-<span class="w">        </span><span class="nt">rules</span><span class="p">:</span>
-<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
-<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GET</span>
-<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/info/refs*&quot;</span>
-<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
-<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
-<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/git-upload-pack&quot;</span>
-<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
-<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
-<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/git-receive-pack&quot;</span>
-<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/git</span><span class="w"> </span><span class="p p-Indicator">}</span>
-
-<span class="w">  </span><span class="c1"># ── GitHub: REST API ─────────────────────────────────────────</span>
-
-<span class="w">  </span><span class="nt">github_api</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-api</span>
-<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.github.com</span>
-<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
-<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
-<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
-<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
-<span class="w">        </span><span class="nt">rules</span><span class="p">:</span>
-<span class="w">          </span><span class="c1"># GraphQL API (used by gh CLI)</span>
-<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
-<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
-<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/graphql&quot;</span>
-<span class="w">          </span><span class="c1"># Full read-write access to the repository</span>
-<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
-<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;*&quot;</span>
-<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/repos/&lt;org&gt;/&lt;repo&gt;/**&quot;</span>
-<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/claude</span><span class="w"> </span><span class="p p-Indicator">}</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/opencode</span><span class="w"> </span><span class="p p-Indicator">}</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/gh</span><span class="w"> </span><span class="p p-Indicator">}</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/curl</span><span class="w"> </span><span class="p p-Indicator">}</span>
-
+<span class="hll"><span class="w">  </span><span class="c1"># ── GitHub: git operations (clone, fetch, push) ──────────────</span>
+</span><span class="hll">
+</span><span class="hll"><span class="w">  </span><span class="nt">github_git</span><span class="p">:</span>
+</span><span class="hll"><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-git</span>
+</span><span class="hll"><span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github.com</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">rules</span><span class="p">:</span>
+</span><span class="hll"><span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GET</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/info/refs*&quot;</span>
+</span><span class="hll"><span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/git-upload-pack&quot;</span>
+</span><span class="hll"><span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/git-receive-pack&quot;</span>
+</span><span class="hll"><span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/git</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span class="hll">
+</span><span class="hll"><span class="w">  </span><span class="c1"># ── GitHub: REST API ─────────────────────────────────────────</span>
+</span><span class="hll">
+</span><span class="hll"><span class="w">  </span><span class="nt">github_api</span><span class="p">:</span>
+</span><span class="hll"><span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-api</span>
+</span><span class="hll"><span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.github.com</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+</span><span class="hll"><span class="w">        </span><span class="nt">rules</span><span class="p">:</span>
+</span><span class="hll"><span class="w">          </span><span class="c1"># GraphQL API (used by gh CLI)</span>
+</span><span class="hll"><span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/graphql&quot;</span>
+</span><span class="hll"><span class="w">          </span><span class="c1"># Full read-write access to the repository</span>
+</span><span class="hll"><span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;*&quot;</span>
+</span><span class="hll"><span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/repos/&lt;org&gt;/&lt;repo&gt;/**&quot;</span>
+</span><span class="hll"><span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/claude</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/opencode</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/gh</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span><span class="hll"><span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/curl</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</span>
 <span class="w">  </span><span class="c1"># ── Package managers ─────────────────────────────────────────</span>
 
 <span class="w">  </span><span class="nt">pypi</span><span class="p">:</span>
@@ -755,17 +767,14 @@ will be blocked until the policy is updated.</p>
 <p class="sd-card-text">The remaining blocks (<code class="docutils literal notranslate"><span class="pre">claude_code</span></code>, <code class="docutils literal notranslate"><span class="pre">nvidia_inference</span></code>, <code class="docutils literal notranslate"><span class="pre">pypi</span></code>, <code class="docutils literal notranslate"><span class="pre">vscode</span></code>) are identical to the <a class="reference internal" href="../reference/default-policy.html"><span class="doc">default policy</span></a>. The default policy’s <code class="docutils literal notranslate"><span class="pre">github_ssh_over_https</span></code> and <code class="docutils literal notranslate"><span class="pre">github_rest_api</span></code> blocks are replaced by the <code class="docutils literal notranslate"><span class="pre">github_git</span></code> and <code class="docutils literal notranslate"><span class="pre">github_api</span></code> blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.</p>
 <p class="sd-card-text">For details on policy block structure, refer to <a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>.</p>
 </div>
-</details></li>
-<li><p>Applies the policy to the running sandbox by running the following command:</p>
+</details></section>
+<section id="apply-the-policy">
+<h2>Apply the Policy<a class="headerlink" href="#apply-the-policy" title="Link to this heading">#</a></h2>
+<p>After you have reviewed the generated policy, apply it to the running sandbox:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>policy<span class="w"> </span><span class="nb">set</span><span class="w"> </span>&lt;sandbox-name&gt;<span class="w"> </span>--policy<span class="w"> </span>/tmp/sandbox-policy-update.yaml<span class="w"> </span>--wait
 </pre></div>
 </div>
-<div class="admonition note">
-<p class="admonition-title">Note</p>
 <p>Network policies are hot-reloadable. The <code class="docutils literal notranslate"><span class="pre">--wait</span></code> flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.</p>
-</div>
-</li>
-</ol>
 </section>
 <section id="retry-the-push">
 <h2>Retry the Push<a class="headerlink" href="#retry-the-push" title="Link to this heading">#</a></h2>
@@ -843,14 +852,16 @@ will be blocked until the policy is updated.</p>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#set-up-a-sandbox-with-your-github-token">Set up a Sandbox with Your GitHub Token</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#set-up-a-sandbox-with-your-github-token">Set Up a Sandbox with Your GitHub Token</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#push-code-to-github">Push Code to GitHub</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#diagnose-the-denial">Diagnose the Denial</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#view-the-logs-from-your-machine">View the Logs from Your Machine</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ask-claude-to-check-the-sandbox-logs">Ask Claude to Check the Sandbox Logs</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ask-claude-code-to-check-the-sandbox-logs">Ask Claude Code to Check the Sandbox Logs</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#update-the-policy-from-your-laptop">Update the Policy from Your Laptop</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#update-the-policy-from-your-machine">Update the Policy from Your Machine</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#review-the-generated-policy">Review the Generated Policy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#apply-the-policy">Apply the Policy</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#retry-the-push">Retry the Push</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#clean-up">Clean Up</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
