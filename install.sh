@@ -16,7 +16,7 @@
 #
 # CLI flags:
 #   --help            - Print usage information
-#   --no-modify-path  - Skip PATH modification in shell profiles
+#   --no-modify-path  - Skip printing PATH setup guidance
 #
 set -eu
 
@@ -55,7 +55,7 @@ USAGE:
     ./install.sh [OPTIONS]
 
 OPTIONS:
-    --no-modify-path    Don't add the install directory to PATH
+    --no-modify-path    Don't print PATH setup guidance
     --help              Print this help message
 
 ENVIRONMENT VARIABLES:
@@ -235,130 +235,28 @@ is_on_path() {
   esac
 }
 
-# Write a small env script that conditionally prepends the install dir to PATH.
-write_env_script_sh() {
-  _install_dir_expr="$1"
-  _env_script="$2"
+# Print PATH setup guidance without modifying shell config files.
+print_path_guidance() {
+  _install_dir="$1"
+  _current_shell="$(basename "${SHELL:-sh}" 2>/dev/null || echo "sh")"
 
-  cat <<ENVEOF > "$_env_script"
-#!/bin/sh
-# Add OpenShell to PATH if not already present
-case ":\${PATH}:" in
-  *:"${_install_dir_expr}":*)
-    ;;
-  *)
-    export PATH="${_install_dir_expr}:\$PATH"
-    ;;
-esac
-ENVEOF
-}
-
-write_env_script_fish() {
-  _install_dir_expr="$1"
-  _env_script="$2"
-
-  cat <<ENVEOF > "$_env_script"
-# Add OpenShell to PATH if not already present
-if not contains "${_install_dir_expr}" \$PATH
-    set -gx PATH "${_install_dir_expr}" \$PATH
-end
-ENVEOF
-}
-
-# Add a `. /path/to/env` line to a shell rc file if not already present.
-add_source_line() {
-  _env_script_path="$1"
-  _rcfile="$2"
-  _shell_type="$3"
-
-  if [ "$_shell_type" = "fish" ]; then
-    _line="source \"${_env_script_path}\""
-  else
-    _line=". \"${_env_script_path}\""
-  fi
-
-  # Check if line already exists
-  if [ -f "$_rcfile" ] && grep -qF "$_line" "$_rcfile" 2>/dev/null; then
+  if is_on_path "$_install_dir"; then
     return 0
   fi
 
-  # Append with a leading newline in case the file doesn't end with one
-  printf '\n%s\n' "$_line" >> "$_rcfile"
-  return 1
-}
+  echo ""
+  info "${APP_NAME} was installed to ${_install_dir}, which is not on your PATH."
+  info "add it to your shell config, for example:"
+  info ""
 
-# Set up PATH modification in common shell rc files.
-setup_path() {
-  _install_dir="$1"
-  _home="$(get_home)"
-  _env_script="${_install_dir}/env"
-  _fish_env_script="${_install_dir}/env.fish"
-  _needs_source=0
-
-  # Replace $HOME in the expression for late-bound references in rc files
-  if [ -n "${HOME:-}" ]; then
-    # shellcheck disable=SC2016
-    _install_dir_expr='$HOME'"${_install_dir#"$_home"}"
-  else
-    _install_dir_expr="$_install_dir"
-  fi
-
-  # Write the env scripts
-  write_env_script_sh "$_install_dir_expr" "$_env_script"
-  write_env_script_fish "$_install_dir_expr" "$_fish_env_script"
-
-  # POSIX shells: .profile, .bashrc, .bash_profile, .zshrc, .zshenv
-  for _rcfile_rel in .profile .bashrc .bash_profile .zshrc .zshenv; do
-    _rcdir="$_home"
-    # zsh respects ZDOTDIR
-    case "$_rcfile_rel" in
-      .zsh*) _rcdir="${ZDOTDIR:-$_home}" ;;
-    esac
-    _rcfile="${_rcdir}/${_rcfile_rel}"
-    if [ -f "$_rcfile" ]; then
-      if ! add_source_line "$_env_script" "$_rcfile" "sh"; then
-        _needs_source=1
-      fi
-    fi
-  done
-
-  # If none of the above existed, create .profile
-  if [ "$_needs_source" = "0" ]; then
-    _found_any=0
-    for _rcfile_rel in .profile .bashrc .bash_profile .zshrc .zshenv; do
-      if [ -f "${_home}/${_rcfile_rel}" ]; then
-        _found_any=1
-        break
-      fi
-    done
-    if [ "$_found_any" = "0" ]; then
-      if ! add_source_line "$_env_script" "${_home}/.profile" "sh"; then
-        _needs_source=1
-      fi
-    fi
-  fi
-
-  # Fish shell
-  _fish_conf_dir="${_home}/.config/fish/conf.d"
-  if [ -d "${_home}/.config/fish" ]; then
-    mkdir -p "$_fish_conf_dir"
-    add_source_line "$_fish_env_script" "${_fish_conf_dir}/${APP_NAME}.env.fish" "fish" || true
-  fi
-
-  # GitHub Actions: write to GITHUB_PATH for CI environments
-  if [ -n "${GITHUB_PATH:-}" ]; then
-    echo "$_install_dir" >> "$GITHUB_PATH"
-  fi
-
-  if [ "$_needs_source" = "1" ] || ! is_on_path "$_install_dir"; then
-    echo ""
-    info "to add ${APP_NAME} to your PATH, restart your shell or run:"
-    info ""
-    info "    source \"${_env_script}\"    (sh, bash, zsh)"
-    if [ -d "${_home}/.config/fish" ]; then
-      info "    source \"${_fish_env_script}\"    (fish)"
-    fi
-  fi
+  case "$_current_shell" in
+    fish)
+      info "    fish_add_path \"${_install_dir}\""
+      ;;
+    *)
+      info "    export PATH=\"${_install_dir}:\$PATH\""
+      ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
@@ -436,11 +334,9 @@ main() {
   _installed_version="$("${_install_dir}/${APP_NAME}" --version 2>/dev/null || echo "${_version}")"
   info "installed ${APP_NAME} ${_installed_version} to ${_install_dir}/${APP_NAME}"
 
-  # Set up PATH for default install location
+  # Print PATH guidance for default install location
   if [ "$_using_default_dir" = "1" ] && [ "$NO_MODIFY_PATH" = "0" ]; then
-    if ! is_on_path "$_install_dir"; then
-      setup_path "$_install_dir"
-    fi
+    print_path_guidance "$_install_dir"
   fi
 }
 
