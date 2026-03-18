@@ -30,6 +30,7 @@ jobs:
             // Check author_association from the webhook payload. This is set by
             // GitHub itself and doesn't require extra token permissions, so it
             // works reliably for org members even when their membership is private.
+            console.log(`${author}: author_association=${authorAssociation}, type=${authorType}`);
             const trustedAssociations = ['MEMBER', 'OWNER', 'COLLABORATOR'];
             if (trustedAssociations.includes(authorAssociation)) {
               console.log(`${author} has author_association=${authorAssociation}. Skipping vouch check.`);
