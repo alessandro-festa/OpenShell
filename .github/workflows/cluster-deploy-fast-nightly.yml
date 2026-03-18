@@ -1,0 +1,58 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Cluster Deploy Fast Nightly
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  checks: write
+
+jobs:
+  report-smoke:
+    name: Report Smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate smoke report artifacts
+        id: generate
+        run: |
+          set -euo pipefail
+          report_dir="$RUNNER_TEMP/cluster-deploy-fast-nightly"
+          mkdir -p "$report_dir"
+          cat > "$report_dir/junit.xml" <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <testsuite name="cluster-deploy-fast-nightly-smoke" tests="1" failures="0" skipped="0">
+            <testcase classname="cluster_deploy_fast.reporting" name="workflow_smoke" time="0" />
+          </testsuite>
+          EOF
+          cat > "$report_dir/summary.md" <<'EOF'
+          # Cluster Deploy Fast Nightly
+
+          Smoke workflow for report publishing.
+          EOF
+          echo "report_dir=$report_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Markdown summary
+        run: cat "${{ steps.generate.outputs.report_dir }}/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload smoke artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-deploy-fast-nightly-smoke-${{ github.run_id }}
+          path: ${{ steps.generate.outputs.report_dir }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Publish test report
+        uses: dorny/test-reporter@v2
+        with:
+          name: Cluster Deploy Fast Nightly
+          path: ${{ steps.generate.outputs.report_dir }}/junit.xml
+          reporter: java-junit
+          use-actions-summary: true
+          report-title: Cluster Deploy Fast Nightly
+          badge-title: fast-deploy
