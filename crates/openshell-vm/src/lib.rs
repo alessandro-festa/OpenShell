@@ -161,6 +161,12 @@ impl VmConfig {
             ],
             workdir: "/".to_string(),
             port_map: vec![
+                // kube-apiserver — k3s runs the API server with host
+                // networking so it listens on VM:6443 directly.  The
+                // host-side readiness check (`wait_for_gateway_service`)
+                // and `recover_stale_pods` both use kubectl against
+                // 127.0.0.1:6443 via the copied kubeconfig.
+                "6443:6443".to_string(),
                 // Navigator server — with bridge CNI the pod listens on
                 // 8080 inside its own network namespace (10.42.0.x), not
                 // on the VM's root namespace. The NodePort service
