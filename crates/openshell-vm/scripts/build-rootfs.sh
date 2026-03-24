@@ -34,9 +34,9 @@ K3S_VERSION="${K3S_VERSION//-k3s/+k3s}"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 # Container images to pre-load into k3s (arm64).
-IMAGE_REPO_BASE="${IMAGE_REPO_BASE:-navigator}"
+IMAGE_REPO_BASE="${IMAGE_REPO_BASE:-openshell}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
-SERVER_IMAGE="${IMAGE_REPO_BASE}/server:${IMAGE_TAG}"
+SERVER_IMAGE="${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}"
 SANDBOX_IMAGE="${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}"
 AGENT_SANDBOX_IMAGE="registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0"
 
@@ -130,12 +130,12 @@ else
 fi
 
 # ── Inject Kubernetes manifests ──────────────────────────────────────
-# These are copied to /opt/navigator/manifests/ (staging). gateway-init.sh
+# These are copied to /opt/openshell/manifests/ (staging). gateway-init.sh
 # moves them to /var/lib/rancher/k3s/server/manifests/ at boot so the
 # k3s Helm Controller auto-deploys them.
 
 MANIFEST_SRC="${PROJECT_ROOT}/deploy/kube/manifests"
-MANIFEST_DEST="${ROOTFS_DIR}/opt/navigator/manifests"
+MANIFEST_DEST="${ROOTFS_DIR}/opt/openshell/manifests"
 
 echo "==> Injecting Kubernetes manifests..."
 mkdir -p "${MANIFEST_DEST}"
@@ -159,7 +159,7 @@ done
 # of images each time.
 
 IMAGES_DIR="${ROOTFS_DIR}/var/lib/rancher/k3s/agent/images"
-IMAGE_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/nemoclaw/gateway/images"
+IMAGE_CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/openshell/gateway/images"
 mkdir -p "${IMAGES_DIR}" "${IMAGE_CACHE_DIR}"
 
 echo "==> Pre-loading container images (arm64)..."
@@ -276,6 +276,45 @@ if [ -f "$HELMCHART" ]; then
         || sed -i '/__CHART_CHECKSUM__/d' "$HELMCHART"
 fi
 
+# Patch agent-sandbox manifest for VM networking constraints.
+AGENT_MANIFEST="${INIT_MANIFESTS}/agent-sandbox.yaml"
+if [ -f "$AGENT_MANIFEST" ]; then
+    # Keep agent-sandbox on pod networking to avoid host port clashes.
+    # Point in-cluster client traffic at the API server node IP because
+    # kube-proxy is disabled in VM mode.
+    sed -i '' '/hostNetwork: true/d' "$AGENT_MANIFEST" 2>/dev/null \
+        || sed -i '/hostNetwork: true/d' "$AGENT_MANIFEST"
+    sed -i '' '/dnsPolicy: ClusterFirstWithHostNet/d' "$AGENT_MANIFEST" 2>/dev/null \
+        || sed -i '/dnsPolicy: ClusterFirstWithHostNet/d' "$AGENT_MANIFEST"
+    sed -i '' 's|image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0|image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0\
+        args:\
+        - -metrics-bind-address=:8082\
+        env:\
+        - name: KUBERNETES_SERVICE_HOST\
+          value: 192.168.127.2\
+        - name: KUBERNETES_SERVICE_PORT\
+          value: "6443"|g' "$AGENT_MANIFEST" 2>/dev/null \
+        || sed -i 's|image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0|image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0\
+        args:\
+        - -metrics-bind-address=:8082\
+        env:\
+        - name: KUBERNETES_SERVICE_HOST\
+          value: 192.168.127.2\
+        - name: KUBERNETES_SERVICE_PORT\
+          value: "6443"|g' "$AGENT_MANIFEST"
+    if grep -q 'hostNetwork: true' "$AGENT_MANIFEST" \
+        || grep -q 'ClusterFirstWithHostNet' "$AGENT_MANIFEST" \
+        || ! grep -q 'KUBERNETES_SERVICE_HOST' "$AGENT_MANIFEST" \
+        || ! grep -q 'metrics-bind-address=:8082' "$AGENT_MANIFEST"; then
+        echo "ERROR: failed to patch agent-sandbox manifest for VM networking constraints: $AGENT_MANIFEST" >&2
+        exit 1
+    fi
+fi
+
+# local-storage implies local-path-provisioner, which requires CNI bridge
+# networking that is unavailable in the VM kernel.
+rm -f "${INIT_MANIFESTS}/local-storage.yaml" 2>/dev/null || true
+
 # Boot k3s in a privileged container. We use a Docker volume for the
 # k3s data directory because kine (SQLite) creates Unix sockets that
 # don't work over bind mounts from macOS. After k3s is ready, we
@@ -317,7 +356,7 @@ docker run -d \
     -v krun-k3s-init-data:/var/lib/rancher/k3s \
     "${BASE_IMAGE_TAG}" \
     /usr/local/bin/k3s server \
-        --disable=traefik,servicelb,metrics-server,coredns,local-path-provisioner \
+        --disable=traefik,servicelb,metrics-server,coredns,local-storage \
         --disable-network-policy \
         --write-kubeconfig-mode=644 \
         --flannel-backend=host-gw \
@@ -363,9 +402,9 @@ done
 # Explicitly import images into containerd's k8s.io namespace, then
 # tag them with the docker.io/ prefix that kubelet expects.
 #
-# When Docker saves "navigator/server:dev", the tarball stores the
-# reference as "navigator/server:dev". But kubelet normalises all
-# short names to "docker.io/navigator/server:dev". Without the
+# When Docker saves "openshell/gateway:dev", the tarball stores the
+# reference as "openshell/gateway:dev". But kubelet normalises all
+# short names to "docker.io/openshell/gateway:dev". Without the
 # re-tag, kubelet can't find the image and falls back to pulling.
 echo "    Importing images into containerd..."
 docker exec "${INIT_CONTAINER_NAME}" sh -c '
@@ -397,8 +436,8 @@ docker exec "${INIT_CONTAINER_NAME}" sh -c '
     /usr/local/bin/k3s ctr images list -q | grep -v "^sha256:" | sort
 
     # Re-tag short-name images with docker.io/ prefix so kubelet can
-    # find them. kubelet normalises "navigator/server:dev" to
-    # "docker.io/navigator/server:dev". Only re-tag images that look
+    # find them. kubelet normalises "openshell/gateway:dev" to
+    # "docker.io/openshell/gateway:dev". Only re-tag images that look
     # like short Docker Hub names (contain "/" but no "." before the
     # first "/", i.e. not registry.k8s.io/... or ghcr.io/...).
     echo ""
@@ -544,7 +583,7 @@ done
 # find them without waiting for the cluster. This is the key to
 # skipping the namespace wait + kubectl apply on every boot.
 echo "    Baking PKI into rootfs..."
-PKI_DEST="${ROOTFS_DIR}/opt/navigator/pki"
+PKI_DEST="${ROOTFS_DIR}/opt/openshell/pki"
 mkdir -p "${PKI_DEST}"
 cp "${PKI_DIR}/ca.crt" "${PKI_DEST}/ca.crt"
 cp "${PKI_DIR}/ca.key" "${PKI_DEST}/ca.key"
@@ -654,7 +693,7 @@ echo "    Images: $(ls "${IMAGES_DIR}"/*.tar.zst 2>/dev/null | wc -l | tr -d ' '
 
 # Write sentinel file so gateway-init.sh and the host-side bootstrap
 # know this rootfs has pre-initialized state.
-echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${ROOTFS_DIR}/opt/navigator/.initialized"
+echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${ROOTFS_DIR}/opt/openshell/.initialized"
 
 docker rm "${INIT_CONTAINER_NAME}" 2>/dev/null || true
 docker volume rm krun-k3s-init-data 2>/dev/null || true
@@ -668,14 +707,14 @@ if [ ! -f "${ROOTFS_DIR}/usr/local/bin/k3s" ]; then
     exit 1
 fi
 
-if [ ! -f "${ROOTFS_DIR}/opt/navigator/.initialized" ]; then
+if [ ! -f "${ROOTFS_DIR}/opt/openshell/.initialized" ]; then
     echo "WARNING: Pre-initialization sentinel not found. Cold starts will be slow."
 fi
 
 echo ""
 echo "==> Rootfs ready at: ${ROOTFS_DIR}"
 echo "    Size: $(du -sh "${ROOTFS_DIR}" | cut -f1)"
-echo "    Pre-initialized: $(cat "${ROOTFS_DIR}/opt/navigator/.initialized" 2>/dev/null || echo 'no')"
+echo "    Pre-initialized: $(cat "${ROOTFS_DIR}/opt/openshell/.initialized" 2>/dev/null || echo 'no')"
 
 # Show k3s data size
 K3S_DATA="${ROOTFS_DIR}/var/lib/rancher/k3s"
@@ -684,11 +723,11 @@ if [ -d "${K3S_DATA}" ]; then
 fi
 
 # Show PKI
-if [ -d "${ROOTFS_DIR}/opt/navigator/pki" ]; then
-    echo "    PKI: baked ($(ls "${ROOTFS_DIR}/opt/navigator/pki/" | wc -l | tr -d ' ') files)"
+if [ -d "${ROOTFS_DIR}/opt/openshell/pki" ]; then
+    echo "    PKI: baked ($(ls "${ROOTFS_DIR}/opt/openshell/pki/" | wc -l | tr -d ' ') files)"
 fi
 
 echo ""
 echo "Next steps:"
-echo "  1. Run:  ncl gateway"
+echo "  1. Run:  openshell gateway"
 echo "  Expected startup time: ~3-5 seconds (pre-initialized)"

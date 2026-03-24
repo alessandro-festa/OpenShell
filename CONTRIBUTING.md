@@ -150,10 +150,23 @@ mise run vm
 
 That task builds `openshell-vm`, stages `gateway.runtime/`, builds the default rootfs under `$XDG_DATA_HOME/openshell/gateway/rootfs`, codesigns `target/debug/gateway` on macOS, and then launches the VM.
 
+Once the VM is running, you can run cluster debug commands against its kubeconfig directly:
+
+```bash
+target/debug/gateway exec -- kubectl get pods -A
+target/debug/gateway exec -- kubectl -n openshell logs statefulset/openshell
+```
+
 If you only want to stage the sidecar runtime bundle without launching the VM:
 
 ```bash
 mise run vm:bundle-runtime
+```
+
+To force a fresh rebuild of the binary, bundled runtime, and rootfs without launching the VM:
+
+```bash
+mise run vm:build
 ```
 
 To create a local tarball that contains both `gateway` and `gateway.runtime/`:

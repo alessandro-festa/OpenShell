@@ -145,9 +145,9 @@ impl VmConfig {
     /// Default gateway configuration: boots k3s server inside the VM.
     ///
     /// Runs `/srv/gateway-init.sh` which mounts essential filesystems,
-    /// deploys the `NemoClaw` helm chart, and execs `k3s server`.
-    /// Exposes the Kubernetes API on port 6443 and the `NemoClaw`
-    /// gateway (navigator server `NodePort`) on port 30051.
+    /// deploys the OpenShell helm chart, and execs `k3s server`.
+    /// Exposes the Kubernetes API on port 6443 and the OpenShell
+    /// gateway (`NodePort`) on port 30051.
     pub fn gateway(rootfs: PathBuf) -> Self {
         Self {
             rootfs,
@@ -297,6 +297,26 @@ pub fn default_runtime_gvproxy_path() -> PathBuf {
     configured_runtime_dir()
         .unwrap_or_else(|_| PathBuf::from(VM_RUNTIME_DIR_NAME))
         .join("gvproxy")
+}
+
+#[cfg(target_os = "macos")]
+fn configure_runtime_loader_env(runtime_dir: &Path) -> Result<(), VmError> {
+    let existing = std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH");
+    let mut paths = vec![runtime_dir.to_path_buf()];
+    if let Some(existing) = existing {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    let joined = std::env::join_paths(paths)
+        .map_err(|e| VmError::HostSetup(format!("join DYLD_FALLBACK_LIBRARY_PATH: {e}")))?;
+    unsafe {
+        std::env::set_var("DYLD_FALLBACK_LIBRARY_PATH", joined);
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn configure_runtime_loader_env(_runtime_dir: &Path) -> Result<(), VmError> {
+    Ok(())
 }
 
 fn raise_nofile_limit() {
@@ -595,7 +615,14 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
 
     // The runtime must already be staged as a sidecar bundle next to the
     // binary (or explicitly pointed to via OPENSHELL_VM_RUNTIME_DIR).
-    resolve_runtime_bundle()?;
+    let runtime_gvproxy = resolve_runtime_bundle()?;
+    let runtime_dir = runtime_gvproxy.parent().ok_or_else(|| {
+        VmError::HostSetup(format!(
+            "runtime bundle file has no parent directory: {}",
+            runtime_gvproxy.display()
+        ))
+    })?;
+    configure_runtime_loader_env(runtime_dir)?;
     raise_nofile_limit();
 
     // ── Configure the microVM ──────────────────────────────────────
@@ -892,7 +919,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                         }
                     }
 
-                    // Bootstrap the NemoClaw control plane: generate PKI,
+                    // Bootstrap the OpenShell control plane: generate PKI,
                     // create TLS secrets, and store cluster metadata so CLI
                     // clients and e2e tests can connect.
                     //
@@ -900,7 +927,9 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                     // this skips the namespace wait and kubectl apply entirely.
                     if let Err(e) = bootstrap_gateway(&dest, &config.rootfs) {
                         eprintln!("Bootstrap failed: {e}");
-                        eprintln!("  The VM is running but NemoClaw may not be fully operational.");
+                        eprintln!(
+                            "  The VM is running but OpenShell may not be fully operational."
+                        );
                     }
                 } else {
                     eprintln!("  kubeconfig not found after 90s (k3s may still be starting)");
@@ -917,7 +946,7 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 recover_stale_pods(&kubeconfig_dest);
 
                 // Wait for the gRPC service to be reachable before
-                // declaring "Ready". The navigator pod needs a few
+                // declaring "Ready". The openshell pod needs a few
                 // seconds after k3s starts to bind its port.
                 wait_for_gateway_service();
             }
@@ -970,10 +999,10 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
 /// Cluster name used for metadata and mTLS storage.
 const GATEWAY_CLUSTER_NAME: &str = "gateway";
 
-/// Gateway port: the host port mapped to the navigator `NodePort` (30051).
+/// Gateway port: the host port mapped to the OpenShell `NodePort` (30051).
 const GATEWAY_PORT: u16 = 30051;
 
-/// Bootstrap the `NemoClaw` control plane after k3s is ready.
+/// Bootstrap the OpenShell control plane after k3s is ready.
 ///
 /// Three paths, fastest first:
 ///
@@ -982,7 +1011,7 @@ const GATEWAY_PORT: u16 = 30051;
 ///    interaction at all. Completes in <50ms.
 ///
 /// 2. **Warm boot**: host-side metadata + mTLS certs survive across VM
-///    restarts. Waits for the navigator namespace, then returns.
+///    restarts. Waits for the openshell namespace, then returns.
 ///
 /// 3. **Cold boot**: generates fresh PKI, waits for namespace, applies
 ///    secrets via kubectl, stores everything on the host.
@@ -1006,10 +1035,10 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
     // ── Path 1: Pre-baked PKI from build-rootfs.sh ─────────────────
     //
     // If the rootfs was pre-initialized, PKI files are baked into
-    // /opt/navigator/pki/. Read them directly — no cluster interaction
+    // /opt/openshell/pki/. Read them directly — no cluster interaction
     // needed. The TLS secrets already exist inside the cluster from
     // the build-time k3s boot.
-    let pki_dir = rootfs.join("opt/navigator/pki");
+    let pki_dir = rootfs.join("opt/openshell/pki");
     if pki_dir.join("ca.crt").is_file() {
         eprintln!("Pre-baked PKI detected — fast bootstrap");
 
@@ -1043,7 +1072,7 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
         );
         eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
         eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
-        eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
+        eprintln!("  mTLS:     ~/.config/openshell/gateways/{GATEWAY_CLUSTER_NAME}/mtls/");
         return Ok(());
     }
 
@@ -1057,7 +1086,7 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
 
     if is_warm_boot() {
         eprintln!("Warm boot detected — reusing existing PKI and metadata.");
-        eprintln!("Waiting for navigator namespace...");
+        eprintln!("Waiting for openshell namespace...");
         wait_for_namespace(kc)?;
         eprintln!(
             "Warm boot ready [{:.1}s]",
@@ -1065,7 +1094,7 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
         );
         eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
         eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
-        eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
+        eprintln!("  mTLS:     ~/.config/openshell/gateways/{GATEWAY_CLUSTER_NAME}/mtls/");
         return Ok(());
     }
 
@@ -1078,7 +1107,7 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
         .map_err(|e| VmError::Bootstrap(format!("failed to store cluster metadata: {e}")))?;
 
     let ns_start = Instant::now();
-    eprintln!("Waiting for navigator namespace...");
+    eprintln!("Waiting for openshell namespace...");
     wait_for_namespace(kc)?;
     eprintln!("Namespace ready [{:.1}s]", ns_start.elapsed().as_secs_f64());
 
@@ -1097,7 +1126,7 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
     );
     eprintln!("  Cluster:  {GATEWAY_CLUSTER_NAME}");
     eprintln!("  Gateway:  https://127.0.0.1:{GATEWAY_PORT}");
-    eprintln!("  mTLS:     ~/.config/nemoclaw/clusters/{GATEWAY_CLUSTER_NAME}/mtls/");
+    eprintln!("  mTLS:     ~/.config/openshell/gateways/{GATEWAY_CLUSTER_NAME}/mtls/");
 
     Ok(())
 }
@@ -1105,8 +1134,8 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
 /// Check whether a previous bootstrap left valid state on disk.
 ///
 /// A warm boot is detected when both:
-/// - Cluster metadata exists: `$XDG_CONFIG_HOME/nemoclaw/clusters/gateway_metadata.json`
-/// - mTLS certs exist: `$XDG_CONFIG_HOME/nemoclaw/clusters/gateway/mtls/{ca.crt,tls.crt,tls.key}`
+/// - Cluster metadata exists: `$XDG_CONFIG_HOME/openshell/gateways/gateway/metadata.json`
+/// - mTLS certs exist: `$XDG_CONFIG_HOME/openshell/gateways/gateway/mtls/{ca.crt,tls.crt,tls.key}`
 ///
 /// When true, the host-side bootstrap (PKI generation, kubectl apply, metadata
 /// storage) can be skipped because the virtio-fs rootfs persists k3s state
@@ -1120,11 +1149,11 @@ fn is_warm_boot() -> bool {
         std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| format!("{home}/.config"));
 
     let config_dir = PathBuf::from(&config_base)
-        .join("nemoclaw")
-        .join("clusters");
+        .join("openshell")
+        .join("gateways");
 
     // Check metadata file.
-    let metadata_path = config_dir.join(format!("{GATEWAY_CLUSTER_NAME}_metadata.json"));
+    let metadata_path = config_dir.join(GATEWAY_CLUSTER_NAME).join("metadata.json");
     if !metadata_path.is_file() {
         return false;
     }
@@ -1142,7 +1171,7 @@ fn is_warm_boot() -> bool {
     true
 }
 
-/// Wait for the navigator pod to become Ready inside the k3s cluster
+/// Wait for the openshell pod to become Ready inside the k3s cluster
 /// and verify the gRPC service is reachable from the host.
 ///
 /// Stale pod/lease records are cleaned from the kine DB at build time
@@ -1173,10 +1202,10 @@ fn wait_for_gateway_service() {
             .args(["--kubeconfig", &kc])
             .args([
                 "-n",
-                "navigator",
+                "openshell",
                 "get",
                 "pod",
-                "navigator-0",
+                "openshell-0",
                 "-o",
                 "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}",
             ])
@@ -1380,7 +1409,7 @@ fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
     }
 }
 
-/// Apply the three TLS K8s secrets required by the `NemoClaw` server.
+/// Apply the three TLS K8s secrets required by the OpenShell server.
 ///
 /// Uses `kubectl apply -f -` on the host, piping JSON manifests via stdin.
 fn apply_tls_secrets(
@@ -1391,7 +1420,7 @@ fn apply_tls_secrets(
     use base64::engine::general_purpose::STANDARD;
 
     let secrets = [
-        // 1. navigator-server-tls (kubernetes.io/tls)
+        // 1. openshell-server-tls (kubernetes.io/tls)
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -1405,7 +1434,7 @@ fn apply_tls_secrets(
                 "tls.key": STANDARD.encode(&bundle.server_key_pem)
             }
         }),
-        // 2. navigator-server-client-ca (Opaque)
+        // 2. openshell-server-client-ca (Opaque)
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",
@@ -1418,7 +1447,7 @@ fn apply_tls_secrets(
                 "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
             }
         }),
-        // 3. navigator-client-tls (Opaque) — shared by CLI and sandbox pods
+        // 3. openshell-client-tls (Opaque) — shared by CLI and sandbox pods
         serde_json::json!({
             "apiVersion": "v1",
             "kind": "Secret",

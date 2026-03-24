@@ -5,11 +5,26 @@
 
 [vm]
 description = "Build and run the standalone gateway microVM"
-depends = ["vm:build", "vm:bundle-runtime", "vm:rootfs", "vm:codesign"]
-run = "target/debug/gateway"
+run = [
+  "mise run vm:build:binary",
+  "tasks/scripts/bundle-vm-runtime.sh",
+  "tasks/scripts/ensure-vm-rootfs.sh",
+  "tasks/scripts/codesign-gateway.sh",
+  "tasks/scripts/run-vm.sh",
+]
 hide = false
 
 ["vm:build"]
+description = "Force a fresh gateway rebuild, including the rootfs"
+run = [
+  "mise run vm:build:binary",
+  "tasks/scripts/bundle-vm-runtime.sh",
+  "OPENSHELL_VM_FORCE_ROOTFS_REBUILD=1 tasks/scripts/ensure-vm-rootfs.sh",
+  "tasks/scripts/codesign-gateway.sh",
+]
+hide = false
+
+["vm:build:binary"]
 description = "Build the standalone gateway binary"
 run = "cargo build -p openshell-vm"
 hide = true
@@ -21,11 +36,12 @@ hide = true
 
 ["vm:rootfs"]
 description = "Build the default gateway rootfs if needed"
-run = "crates/openshell-vm/scripts/build-rootfs.sh"
+run = "tasks/scripts/ensure-vm-rootfs.sh"
 hide = true
 
 ["vm:codesign"]
 description = "Codesign the gateway binary for Hypervisor.framework access on macOS"
+depends = ["vm:build:binary"]
 run = "tasks/scripts/codesign-gateway.sh"
 hide = true
 

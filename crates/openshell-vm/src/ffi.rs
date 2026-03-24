@@ -7,7 +7,8 @@
 //! `gateway` binary loads `libkrun` from the staged `gateway.runtime/`
 //! sidecar bundle on first use.
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use libc::c_char;
@@ -86,6 +87,9 @@ pub fn libkrun() -> Result<&'static LibKrun, VmError> {
 impl LibKrun {
     fn load() -> Result<Self, VmError> {
         let path = runtime_libkrun_path()?;
+        preload_runtime_support_libraries(path.parent().ok_or_else(|| {
+            VmError::HostSetup(format!("libkrun has no parent dir: {}", path.display()))
+        })?)?;
         let library = Box::leak(Box::new(unsafe {
             Library::new(&path).map_err(|e| {
                 VmError::HostSetup(format!("load libkrun from {}: {e}", path.display()))
@@ -119,6 +123,60 @@ fn runtime_libkrun_path() -> Result<PathBuf, VmError> {
     Ok(crate::configured_runtime_dir()?.join(required_runtime_lib_name()))
 }
 
+fn preload_runtime_support_libraries(runtime_dir: &Path) -> Result<(), VmError> {
+    let entries = fs::read_dir(runtime_dir)
+        .map_err(|e| VmError::HostSetup(format!("read {}: {e}", runtime_dir.display())))?;
+
+    let mut support_libs: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| {
+                    #[cfg(target_os = "macos")]
+                    {
+                        name.starts_with("libkrunfw") && name.ends_with(".dylib")
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        name.starts_with("libkrunfw") && name.contains(".so")
+                    }
+                })
+                .unwrap_or(false)
+        })
+        .collect();
+
+    support_libs.sort();
+
+    for path in support_libs {
+        let path_cstr = std::ffi::CString::new(path.to_string_lossy().as_bytes()).map_err(|e| {
+            VmError::HostSetup(format!(
+                "invalid support library path {}: {e}",
+                path.display()
+            ))
+        })?;
+        let handle =
+            unsafe { libc::dlopen(path_cstr.as_ptr(), libc::RTLD_NOW | libc::RTLD_GLOBAL) };
+        if handle.is_null() {
+            let error = unsafe {
+                let err = libc::dlerror();
+                if err.is_null() {
+                    "unknown dlopen error".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(err).to_string_lossy().into_owned()
+                }
+            };
+            return Err(VmError::HostSetup(format!(
+                "preload runtime support library {}: {error}",
+                path.display()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn required_runtime_lib_name() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -133,7 +191,7 @@ fn required_runtime_lib_name() -> &'static str {
 fn load_symbol<T: Copy>(
     library: &'static Library,
     symbol: &[u8],
-    path: &std::path::Path,
+    path: &Path,
 ) -> Result<T, VmError> {
     let loaded = unsafe {
         library.get::<T>(symbol).map_err(|e| {

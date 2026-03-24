@@ -25,7 +25,7 @@ serviceAccount:
 # native-snapshotter + virtiofs incompatibility on sandbox re-creation.
 automountServiceAccountToken: true
 
-# When automountServiceAccountToken is false, the navigator server needs
+# When automountServiceAccountToken is false, the OpenShell gateway needs
 # a kubeconfig to reach the API server. Point this to the directory
 # containing the k3s kubeconfig (k3s.yaml). Only used when
 # automountServiceAccountToken is false.
@@ -69,7 +69,7 @@ probes:
 
 resources: {}
 
-# Persistent storage for the navigator database. When disabled, an
+# Persistent storage for the OpenShell database. When disabled, an
 # emptyDir volume is used instead of a PVC. This is useful in microVM
 # environments where overlayfs-on-virtiofs doesn't support PVC mounts
 # reliably.

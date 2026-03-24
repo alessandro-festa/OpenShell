@@ -6,7 +6,7 @@
 #
 # Mounts essential virtual filesystems, configures networking, then execs
 # k3s server. If the rootfs was pre-initialized by build-rootfs.sh (sentinel
-# at /opt/navigator/.initialized), the full manifest setup is skipped and
+# at /opt/openshell/.initialized), the full manifest setup is skipped and
 # k3s resumes from its persisted state (~3-5s startup).
 
 set -e
@@ -21,7 +21,7 @@ ts() {
 }
 
 PRE_INITIALIZED=false
-if [ -f /opt/navigator/.initialized ]; then
+if [ -f /opt/openshell/.initialized ]; then
     PRE_INITIALIZED=true
     ts "pre-initialized rootfs detected (fast path)"
 fi
@@ -148,7 +148,7 @@ find /run -name '*.sock' -delete 2>/dev/null || true
 # bolt metadata database (meta.db) because it contains snapshot and image
 # metadata that containerd needs to avoid re-extracting all image layers
 # on every boot. The native snapshotter on virtio-fs takes ~2 min to
-# extract the navigator/server image; keeping meta.db lets containerd
+# extract the openshell/gateway image; keeping meta.db lets containerd
 # know the snapshots already exist.
 #
 # The kine (SQLite) DB cleanup in build-rootfs.sh already removes stale
@@ -175,9 +175,10 @@ ts "stale artifacts cleaned"
 # On pre-initialized rootfs, manifests are already in place from the
 # build-time k3s boot. Skip this entirely for fast startup.
 
+K3S_MANIFESTS="/var/lib/rancher/k3s/server/manifests"
+BUNDLED_MANIFESTS="/opt/openshell/manifests"
+
 if [ "$PRE_INITIALIZED" = false ]; then
-    K3S_MANIFESTS="/var/lib/rancher/k3s/server/manifests"
-    BUNDLED_MANIFESTS="/opt/navigator/manifests"
 
     mkdir -p "$K3S_MANIFESTS"
 
@@ -188,8 +189,8 @@ if [ "$PRE_INITIALIZED" = false ]; then
             cp "$manifest" "$K3S_MANIFESTS/"
         done
 
-        # Remove stale navigator-managed manifests from previous boots.
-        for existing in "$K3S_MANIFESTS"/navigator-*.yaml \
+        # Remove stale OpenShell-managed manifests from previous boots.
+        for existing in "$K3S_MANIFESTS"/openshell-*.yaml \
                         "$K3S_MANIFESTS"/agent-*.yaml; do
             [ ! -f "$existing" ] && continue
             basename=$(basename "$existing")
@@ -199,28 +200,66 @@ if [ "$PRE_INITIALIZED" = false ]; then
         done
     fi
 
-    # Patch the HelmChart manifest for VM deployment.
-    HELMCHART="$K3S_MANIFESTS/navigator-helmchart.yaml"
-    if [ -f "$HELMCHART" ]; then
-        # Use pre-loaded images — don't pull from registry.
-        sed -i 's|pullPolicy: Always|pullPolicy: IfNotPresent|' "$HELMCHART"
-        # Clear SSH gateway placeholders (default 127.0.0.1 is correct for local VM).
-        sed -i 's|sshGatewayHost: __SSH_GATEWAY_HOST__|sshGatewayHost: ""|g' "$HELMCHART"
-        sed -i 's|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g' "$HELMCHART"
-    fi
-
     ts "manifests deployed"
 else
     ts "skipping manifest deploy (pre-initialized)"
 fi
 
+# Patch manifests for VM deployment constraints.
+HELMCHART="$K3S_MANIFESTS/openshell-helmchart.yaml"
+if [ -f "$HELMCHART" ]; then
+    # Use pre-loaded images — don't pull from registry.
+    sed -i 's|pullPolicy: Always|pullPolicy: IfNotPresent|' "$HELMCHART"
+    # VM bootstrap runs without CNI bridge networking.
+    sed -i 's|__HOST_NETWORK__|true|g' "$HELMCHART"
+    sed -i 's|__AUTOMOUNT_SA_TOKEN__|false|g' "$HELMCHART"
+    sed -i 's|__KUBECONFIG_HOST_PATH__|"/etc/rancher/k3s"|g' "$HELMCHART"
+    sed -i 's|__PERSISTENCE_ENABLED__|false|g' "$HELMCHART"
+    sed -i 's|__DB_URL__|"sqlite:/tmp/openshell.db"|g' "$HELMCHART"
+    # Clear SSH gateway placeholders (default 127.0.0.1 is correct for local VM).
+    sed -i 's|sshGatewayHost: __SSH_GATEWAY_HOST__|sshGatewayHost: ""|g' "$HELMCHART"
+    sed -i 's|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g' "$HELMCHART"
+fi
+
+AGENT_MANIFEST="$K3S_MANIFESTS/agent-sandbox.yaml"
+if [ -f "$AGENT_MANIFEST" ]; then
+    # Keep agent-sandbox on pod networking to avoid host port clashes.
+    # Point in-cluster client traffic at the API server node IP because
+    # kube-proxy is disabled in VM mode.
+    sed -i '/hostNetwork: true/d' "$AGENT_MANIFEST"
+    sed -i '/dnsPolicy: ClusterFirstWithHostNet/d' "$AGENT_MANIFEST"
+    if ! grep -q 'metrics-bind-address=:8082' "$AGENT_MANIFEST"; then
+        sed -i 's|image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0|image: registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0\
+        args:\
+        - -metrics-bind-address=:8082\
+        env:\
+        - name: KUBERNETES_SERVICE_HOST\
+          value: 192.168.127.2\
+        - name: KUBERNETES_SERVICE_PORT\
+          value: "6443"|g' "$AGENT_MANIFEST"
+    else
+        sed -i 's|value: 127.0.0.1|value: 192.168.127.2|g' "$AGENT_MANIFEST"
+    fi
+    if grep -q 'hostNetwork: true' "$AGENT_MANIFEST" \
+        || grep -q 'ClusterFirstWithHostNet' "$AGENT_MANIFEST" \
+        || ! grep -q 'KUBERNETES_SERVICE_HOST' "$AGENT_MANIFEST" \
+        || ! grep -q 'metrics-bind-address=:8082' "$AGENT_MANIFEST"; then
+        echo "ERROR: failed to patch agent-sandbox manifest for VM networking constraints: $AGENT_MANIFEST" >&2
+        exit 1
+    fi
+fi
+
+# local-storage implies local-path-provisioner, which requires CNI bridge
+# networking that is unavailable in the VM kernel.
+rm -f "$K3S_MANIFESTS/local-storage.yaml" 2>/dev/null || true
+
 # ── CNI configuration (iptables-free) ───────────────────────────────────
 # The libkrun VM kernel has no netfilter/iptables support. Flannel's
 # masquerade rules and kube-proxy both require iptables and crash without
-# it. We disable both and use a simple bridge CNI with host-local IPAM
-# instead. This is sufficient for single-node pod networking.
+# it. We disable both and use a simple ptp CNI with host-local IPAM
+# instead. This avoids linux bridge requirements in the VM kernel.
 #
-# ipMasq=false avoids any iptables calls in the bridge plugin.
+# ipMasq=false avoids any iptables calls in the plugin.
 # portmap plugin removed — it requires iptables for DNAT rules.
 #
 # containerd falls back to default CNI paths:
@@ -232,17 +271,14 @@ CNI_CONF_DIR="/etc/cni/net.d"
 CNI_BIN_DIR="/opt/cni/bin"
 mkdir -p "$CNI_CONF_DIR" "$CNI_BIN_DIR"
 
-cat > "$CNI_CONF_DIR/10-bridge.conflist" << 'CNICFG'
+cat > "$CNI_CONF_DIR/10-ptp.conflist" << 'CNICFG'
 {
   "cniVersion": "1.0.0",
-  "name": "bridge",
+  "name": "ptp",
   "plugins": [
     {
-      "type": "bridge",
-      "bridge": "cni0",
-      "isGateway": true,
+      "type": "ptp",
       "ipMasq": false,
-      "hairpinMode": true,
       "ipam": {
         "type": "host-local",
         "ranges": [[{ "subnet": "10.42.0.0/24" }]],
@@ -260,7 +296,7 @@ CNICFG
 # k3s extracts its tools to /var/lib/rancher/k3s/data/<hash>/bin/.
 K3S_DATA_BIN=$(find /var/lib/rancher/k3s/data -maxdepth 2 -name bin -type d 2>/dev/null | head -1)
 if [ -n "$K3S_DATA_BIN" ]; then
-    for plugin in bridge host-local loopback bandwidth; do
+    for plugin in ptp host-local loopback bandwidth; do
         [ -f "$K3S_DATA_BIN/$plugin" ] && ln -sf "$K3S_DATA_BIN/$plugin" "$CNI_BIN_DIR/$plugin"
     done
     ts "CNI binaries linked from $K3S_DATA_BIN"
@@ -272,16 +308,16 @@ fi
 # (pre-baked state from the Docker build used host-gw flannel).
 rm -f "/var/lib/rancher/k3s/agent/etc/cni/net.d/10-flannel.conflist" 2>/dev/null || true
 
-ts "bridge CNI configured (iptables-free)"
+ts "ptp CNI configured (iptables-free, no linux bridge)"
 
 # ── Start k3s ──────────────────────────────────────────────────────────
 # Flags tuned for fast single-node startup:
 #   --disable=traefik,servicelb,metrics-server: skip unused controllers
-#   --disable=coredns,local-path-provisioner: can't run without bridge CNI
-#       (no CONFIG_BRIDGE in libkrunfw kernel). Only hostNetwork pods work.
+#   --disable=coredns,local-storage: local-storage implies local-path
+#       provisioner and requires bridge-based networking unavailable in VM
 #   --disable-network-policy: skip network policy controller
 #   --disable-kube-proxy: VM kernel has no netfilter/iptables
-#   --flannel-backend=none: replaced with bridge CNI above
+#   --flannel-backend=none: replaced with ptp CNI above
 #   --snapshotter=native: overlayfs is incompatible with virtiofs (the
 #       host-backed filesystem in libkrun). Operations inside overlayfs
 #       mounts on virtiofs fail with ECONNRESET. The native snapshotter
@@ -289,7 +325,7 @@ ts "bridge CNI configured (iptables-free)"
 
 ts "starting k3s server"
 exec /usr/local/bin/k3s server \
-    --disable=traefik,servicelb,metrics-server,coredns,local-path-provisioner \
+    --disable=traefik,servicelb,metrics-server,coredns,local-storage \
     --disable-network-policy \
     --disable-kube-proxy \
     --write-kubeconfig-mode=644 \

@@ -6,7 +6,7 @@
 //! These tests require:
 //! - libkrun installed (e.g. `brew tap slp/krun && brew install libkrun`)
 //! - macOS ARM64 with Apple Hypervisor.framework
-//! - A pre-built rootfs at `~/.local/share/nemoclaw/gateway/rootfs`
+//! - A pre-built rootfs at `~/.local/share/openshell/gateway/rootfs`
 //!
 //! All tests are `#[ignore]` — run them explicitly:
 //!
@@ -58,7 +58,7 @@ fn assert_runtime_bundle_staged() {
 
 // ── Tests ──────────────────────────────────────────────────────────────
 
-/// Boot the full NemoClaw gateway and verify the gRPC service becomes
+/// Boot the full OpenShell gateway and verify the gRPC service becomes
 /// reachable on port 30051.
 #[test]
 #[ignore] // requires libkrun + rootfs
@@ -71,7 +71,7 @@ fn gateway_boots_and_service_becomes_reachable() {
 
     let mut child = cmd.spawn().expect("failed to start gateway");
 
-    // Poll for the navigator gRPC service.
+    // Poll for the OpenShell gRPC service.
     let addr: SocketAddr = ([127, 0, 0, 1], 30051).into();
     let timeout = Duration::from_secs(180);
     let start = Instant::now();
