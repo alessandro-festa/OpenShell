@@ -243,17 +243,17 @@ if [ -f "$HELMCHART" ]; then
     sed -i '' "s|server:[[:space:]]*sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest|server:\n      sandboxImage: ${SANDBOX_IMAGE}|g" "$HELMCHART" 2>/dev/null || true
     sed -i '' "s|sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest|sandboxImage: ${SANDBOX_IMAGE}|g" "$HELMCHART" 2>/dev/null \
         || sed -i "s|sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest|sandboxImage: ${SANDBOX_IMAGE}|g" "$HELMCHART"
-    # Enable hostNetwork for VM (no kube-proxy / iptables).
-    sed -i '' 's|__HOST_NETWORK__|true|g' "$HELMCHART" 2>/dev/null \
-        || sed -i 's|__HOST_NETWORK__|true|g' "$HELMCHART"
-    # Disable SA token automount. The projected volume at
-    # /var/run/secrets/kubernetes.io/serviceaccount fails on sandbox
-    # re-creation because /var/run is a symlink to /run in the container
-    # image and the native snapshotter + virtiofs combination can't
-    # resolve it correctly on the second mount.
-    sed -i '' 's|__AUTOMOUNT_SA_TOKEN__|false|g' "$HELMCHART" 2>/dev/null \
-        || sed -i 's|__AUTOMOUNT_SA_TOKEN__|false|g' "$HELMCHART"
-    # Mount the k3s kubeconfig into the pod since SA token isn't mounted.
+    # Bridge CNI: pods use normal pod networking, not hostNetwork.
+    # This must match what gateway-init.sh applies at runtime so the
+    # HelmChart manifest is unchanged at boot — preventing a helm
+    # upgrade job that would cycle the pre-baked pod.
+    sed -i '' 's|__HOST_NETWORK__|false|g' "$HELMCHART" 2>/dev/null \
+        || sed -i 's|__HOST_NETWORK__|false|g' "$HELMCHART"
+    # Enable SA token automount for bridge CNI mode. Must match
+    # gateway-init.sh runtime value to avoid manifest delta.
+    sed -i '' 's|__AUTOMOUNT_SA_TOKEN__|true|g' "$HELMCHART" 2>/dev/null \
+        || sed -i 's|__AUTOMOUNT_SA_TOKEN__|true|g' "$HELMCHART"
+    # Mount the k3s kubeconfig into the pod for VM mode.
     sed -i '' 's|__KUBECONFIG_HOST_PATH__|"/etc/rancher/k3s"|g' "$HELMCHART" 2>/dev/null \
         || sed -i 's|__KUBECONFIG_HOST_PATH__|"/etc/rancher/k3s"|g' "$HELMCHART"
     # Disable persistence — use /tmp for the SQLite database. PVC mounts

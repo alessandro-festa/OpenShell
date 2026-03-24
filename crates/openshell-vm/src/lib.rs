@@ -161,12 +161,12 @@ impl VmConfig {
             ],
             workdir: "/".to_string(),
             port_map: vec![
-                // Navigator server — with hostNetwork the server binds
-                // directly to port 8080 on the VM's interface, bypassing
-                // NodePort (which requires kube-proxy / iptables).
-                // Map host 30051 -> guest 8080 so the external-facing
-                // port stays the same for CLI clients.
-                "30051:8080".to_string(),
+                // Navigator server — with bridge CNI the pod listens on
+                // 8080 inside its own network namespace (10.42.0.x), not
+                // on the VM's root namespace. The NodePort service
+                // (kube-proxy nftables) forwards VM:30051 → pod:8080.
+                // gvproxy maps host:30051 → VM:30051 to complete the path.
+                "30051:30051".to_string(),
             ],
             vsock_ports: vec![],
             log_level: 3, // Info — for debugging
