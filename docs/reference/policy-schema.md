@@ -198,6 +198,12 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 | `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
 | `allow.query` | map | No | Query parameter matchers keyed by decoded param name. Matcher value can be a glob string (`tag: "foo-*"`) or an object with `any` (`tag: { any: ["foo-*", "bar-*"] }`). |
 
+**Path matching behavior:**
+
+- Path rules match only the path component of the request URI (everything before `?`).
+- Query strings are not evaluated by path rules. A rule with `path: /api/v1/download` matches both `/api/v1/download` and `/api/v1/download?slug=my-skill&version=1.0`.
+- Glob patterns use `/` as the segment delimiter. `*` matches within a single segment, `**` matches across segments.
+
 Example with rules:
 
 ```yaml
