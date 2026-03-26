@@ -421,7 +421,26 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             target_os = "redox"
         )))]
         {
+            // Snapshot the container-level supplemental GIDs (e.g. injected by
+            // CDI for GPU device access) before initgroups replaces them.
+            // Exclude GID 0 (root) to avoid inadvertent privilege retention.
+            let root_gid = nix::unistd::Gid::from_raw(0);
+            let container_gids: Vec<nix::unistd::Gid> = nix::unistd::getgroups()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|&g| g != root_gid)
+                .collect();
             nix::unistd::initgroups(user_cstr.as_c_str(), group.gid).into_diagnostic()?;
+            // Merge back any CDI-injected GIDs that initgroups dropped so that
+            // exec'd processes retain access to GPU devices (e.g. /dev/nvmap on
+            // Tegra requires the video GID).
+            let mut merged: Vec<nix::unistd::Gid> = nix::unistd::getgroups().unwrap_or_default();
+            for gid in container_gids {
+                if !merged.contains(&gid) {
+                    merged.push(gid);
+                }
+            }
+            nix::unistd::setgroups(&merged).into_diagnostic()?;
         }
     }
 
