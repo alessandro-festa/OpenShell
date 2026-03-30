@@ -1,7 +1,11 @@
 name: Branch E2E Checks
 
+# pull_request_target runs in the base repo context with write permissions,
+# enabling fork PRs to push docker images to GHCR and run e2e tests.
+# Security: the test:e2e label is a maintainer trust gate — only org members
+# can apply it, signalling that the PR code has been reviewed.
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, labeled]
 
 permissions:
@@ -16,6 +20,7 @@ jobs:
       component: gateway
       platform: linux/arm64
       runner: build-arm64
+      ref: ${{ github.event.pull_request.head.sha }}
 
   build-cluster:
     if: contains(github.event.pull_request.labels.*.name, 'test:e2e')
@@ -24,10 +29,12 @@ jobs:
       component: cluster
       platform: linux/arm64
       runner: build-arm64
+      ref: ${{ github.event.pull_request.head.sha }}
 
   e2e:
     needs: [build-gateway, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
-      image-tag: ${{ github.sha }}
+      image-tag: ${{ github.event.pull_request.head.sha }}
       runner: build-arm64
+      ref: ${{ github.event.pull_request.head.sha }}
