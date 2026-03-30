@@ -10,7 +10,9 @@ permissions:
 
 jobs:
   build-gateway:
-    if: contains(github.event.pull_request.labels.*.name, 'test:e2e')
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'test:e2e') &&
+      github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
@@ -18,7 +20,9 @@ jobs:
       runner: build-arm64
 
   build-cluster:
-    if: contains(github.event.pull_request.labels.*.name, 'test:e2e')
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'test:e2e') &&
+      github.event.pull_request.head.repo.full_name == github.repository
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
