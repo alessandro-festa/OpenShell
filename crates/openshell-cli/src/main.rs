@@ -1943,8 +1943,8 @@ async fn main() -> Result<()> {
                     compact,
                     html,
                 } => {
-                    let mut cmd = std::process::Command::new("python3");
-                    cmd.args(["-m", "openshell.prover.cli", "prove"]);
+                    let mut cmd = std::process::Command::new("uv");
+                    cmd.args(["run", "python3", "-m", "openshell.prover.cli", "prove"]);
                     cmd.args(["--policy", &policy]);
                     cmd.args(["--credentials", &credentials]);
                     if let Some(ref reg) = registry {
@@ -1961,7 +1961,7 @@ async fn main() -> Result<()> {
                     }
                     let status = cmd
                         .status()
-                        .map_err(|e| miette::miette!("failed to execute policy prover: {e} — is the 'prover' optional dependency installed? (uv pip install 'openshell[prover]')"))?;
+                        .map_err(|e| miette::miette!("failed to execute policy prover: {e} — requires 'uv' and prover deps (uv sync)"))?;
                     if !status.success() {
                         std::process::exit(status.code().unwrap_or(1));
                     }
