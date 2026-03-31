@@ -1961,8 +1961,7 @@ async fn main() -> Result<()> {
                     }
                     let status = cmd
                         .status()
-                        .into_diagnostic()
-                        .wrap_err("failed to execute policy prover — is the 'prover' optional dependency installed? (uv pip install 'openshell[prover]')")?;
+                        .map_err(|e| miette::miette!("failed to execute policy prover: {e} — is the 'prover' optional dependency installed? (uv pip install 'openshell[prover]')"))?;
                     if !status.success() {
                         std::process::exit(status.code().unwrap_or(1));
                     }
