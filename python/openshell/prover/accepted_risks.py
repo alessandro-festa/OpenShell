@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 class AcceptedRisk:
     query: str
     reason: str
-    accepted_by: str = ""
     binary: str = ""
     endpoint: str = ""
 
@@ -34,7 +33,6 @@ def load_accepted_risks(path: Path) -> list[AcceptedRisk]:
         AcceptedRisk(
             query=r.get("query", ""),
             reason=r.get("reason", ""),
-            accepted_by=r.get("accepted_by", ""),
             binary=r.get("binary", ""),
             endpoint=r.get("endpoint", ""),
         )
@@ -45,7 +43,7 @@ def load_accepted_risks(path: Path) -> list[AcceptedRisk]:
 def _path_matches_risk(path, risk: AcceptedRisk) -> bool:
     """Check if a single finding path matches an accepted risk."""
     if risk.binary:
-        path_binary = getattr(path, "binary", "") or getattr(path, "parent", "")
+        path_binary = getattr(path, "binary", "")
         if path_binary != risk.binary:
             return False
 
@@ -75,21 +73,6 @@ def apply_accepted_risks(
         matching_risks = [r for r in accepted if r.query == finding.query]
         if not matching_risks:
             result.append(finding)
-            continue
-
-        if not finding.paths:
-            # Pathless finding (e.g., inference relay) — accept if query matches
-            accepted_finding = Finding(
-                query=finding.query,
-                title=finding.title,
-                description=finding.description,
-                risk=finding.risk,
-                paths=finding.paths,
-                remediation=finding.remediation,
-                accepted=True,
-                accepted_reason=matching_risks[0].reason,
-            )
-            result.append(accepted_finding)
             continue
 
         unmatched_paths = []

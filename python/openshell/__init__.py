@@ -10,7 +10,7 @@ import contextlib
 # Proto stubs may not be generated yet (requires Rust build).
 # Suppress so subpackages like openshell.prover can still be imported.
 with contextlib.suppress(ImportError):
-    from .sandbox import (
+    from .sandbox import (  # noqa: F401 — intentional re-exports
         ClusterInferenceConfig,
         ExecChunk,
         ExecResult,
@@ -30,7 +30,7 @@ try:
 except Exception:
     __version__ = "0.0.0"
 
-__all__ = [
+_SDK_SYMBOLS = [
     "ClusterInferenceConfig",
     "ExecChunk",
     "ExecResult",
@@ -41,5 +41,6 @@ __all__ = [
     "SandboxRef",
     "SandboxSession",
     "TlsConfig",
-    "__version__",
 ]
+
+__all__ = [s for s in _SDK_SYMBOLS if s in dir()] + ["__version__"]

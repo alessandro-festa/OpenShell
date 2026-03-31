@@ -113,12 +113,16 @@ class NetworkPolicyRule:
 @dataclass
 class FilesystemPolicy:
     include_workdir: bool = True
+    workdir: str = "/sandbox"
     read_only: list[str] = field(default_factory=list)
     read_write: list[str] = field(default_factory=list)
 
     @property
     def readable_paths(self) -> list[str]:
-        return self.read_only + self.read_write
+        paths = self.read_only + self.read_write
+        if self.include_workdir and self.workdir not in paths:
+            paths = [self.workdir, *paths]
+        return paths
 
 
 @dataclass
@@ -170,6 +174,7 @@ def parse_policy(path: Path) -> PolicyModel:
     fs_raw = raw.get("filesystem_policy", {}) or {}
     fs = FilesystemPolicy(
         include_workdir=fs_raw.get("include_workdir", True),
+        workdir=fs_raw.get("workdir", "/sandbox"),
         read_only=fs_raw.get("read_only", []),
         read_write=fs_raw.get("read_write", []),
     )

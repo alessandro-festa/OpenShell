@@ -15,7 +15,7 @@ from .binary_registry import load_binary_registry
 from .credential_loader import load_credential_set
 from .policy_parser import parse_policy
 from .queries import run_all_queries
-from .report import render_report
+from .report import render_compact, render_report
 from .z3_model import build_model
 
 _DEFAULT_REGISTRY = Path(__file__).parent / "registry"
@@ -59,29 +59,7 @@ def main():
     verify_parser.add_argument(
         "--compact",
         action="store_true",
-        help="One-line-per-finding output (for demos and CI)",
-    )
-    verify_parser.add_argument(
-        "--color",
-        action="store_true",
-        help="Force colored output even when piped",
-    )
-    verify_parser.add_argument(
-        "--mermaid",
-        action="store_true",
-        help="Output Mermaid findings graph (risk paths by query type)",
-    )
-    verify_parser.add_argument(
-        "--mermaid-topology",
-        action="store_true",
-        help="Output Mermaid policy topology map (all endpoints, binaries, enforcement levels)",
-    )
-    verify_parser.add_argument(
-        "--html",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="Output self-contained HTML report with interactive diagrams (e.g., --html report.html)",
+        help="One-line-per-finding output (for CI)",
     )
 
     args = parser.parse_args()
@@ -97,9 +75,8 @@ def main():
 
 def cmd_prove(args) -> int:
     """Execute the prove command."""
-    console = Console(force_terminal=args.color) if args.color else Console()
+    console = Console()
 
-    # Load inputs
     try:
         policy = parse_policy(args.policy)
     except Exception as e:
@@ -118,13 +95,9 @@ def cmd_prove(args) -> int:
         console.print(f"[red]Error loading binary registry: {e}[/red]")
         return 2
 
-    # Build model
     model = build_model(policy, credential_set, binary_registry)
-
-    # Run queries
     findings = run_all_queries(model)
 
-    # Apply accepted risks
     if args.accepted_risks:
         try:
             from .accepted_risks import apply_accepted_risks, load_accepted_risks
@@ -135,36 +108,7 @@ def cmd_prove(args) -> int:
             console.print(f"[red]Error loading accepted risks: {e}[/red]")
             return 2
 
-    # Render
-    has_critical_high = any(
-        f.risk.value in ("critical", "high") and not f.accepted for f in findings
-    )
-    if args.html:
-        from .report import render_html
-
-        exit_code = render_html(
-            findings,
-            str(args.policy),
-            str(args.credentials),
-            policy,
-            binary_registry,
-            args.html,
-        )
-        console.print(f"Report written to {args.html}")
-        return exit_code
-    elif args.mermaid_topology:
-        from .report import generate_mermaid_topology
-
-        print(generate_mermaid_topology(policy, binary_registry, findings))
-        return 1 if has_critical_high else 0
-    elif args.mermaid:
-        from .report import generate_mermaid
-
-        print(generate_mermaid(findings))
-        return 1 if has_critical_high else 0
-    elif args.compact:
-        from .report import render_compact
-
+    if args.compact:
         return render_compact(
             findings,
             str(args.policy),

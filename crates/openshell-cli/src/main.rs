@@ -1421,9 +1421,8 @@ enum PolicyCommands {
 
     /// Formally verify a policy using the OpenShell Policy Prover (OPP).
     ///
-    /// Runs Z3-based verification queries against a sandbox policy to detect
-    /// data exfiltration paths, write bypass attacks, L7 enforcement gaps,
-    /// and privilege escalation via binary capabilities.
+    /// Answers two questions: "Can data leave this sandbox?" and
+    /// "Can the agent write despite read-only intent?"
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Prove {
         /// Path to the sandbox policy YAML file.
@@ -1445,10 +1444,6 @@ enum PolicyCommands {
         /// One-line-per-finding output for CI.
         #[arg(long)]
         compact: bool,
-
-        /// Output self-contained HTML report to this path.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        html: Option<String>,
     },
 }
 
@@ -1941,10 +1936,11 @@ async fn main() -> Result<()> {
                     registry,
                     accepted_risks,
                     compact,
-                    html,
                 } => {
                     let mut cmd = std::process::Command::new("uv");
                     cmd.args(["run", "python3", "-m", "openshell.prover.cli", "prove"]);
+                    // Ensure openshell package is importable from the repo's python/ dir
+                    cmd.env("PYTHONPATH", "python");
                     cmd.args(["--policy", &policy]);
                     cmd.args(["--credentials", &credentials]);
                     if let Some(ref reg) = registry {
@@ -1955,9 +1951,6 @@ async fn main() -> Result<()> {
                     }
                     if compact {
                         cmd.arg("--compact");
-                    }
-                    if let Some(ref html_path) = html {
-                        cmd.args(["--html", html_path]);
                     }
                     let status = cmd
                         .status()
