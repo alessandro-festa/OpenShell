@@ -426,6 +426,10 @@
 This page documents every configurable control, its default, what it protects, and the risk of relaxing it.</p>
 <p>For the full policy YAML schema, refer to the <a class="reference internal" href="../reference/policy-schema.html"><span class="doc">Policy Schema Reference</span></a>.
 For the architecture of each enforcement layer, refer to <a class="reference internal" href="../about/architecture.html"><span class="doc">How OpenShell Works</span></a>.</p>
+<div class="admonition seealso">
+<p class="admonition-title">See also</p>
+<p>If you use <a class="reference external" href="https://github.com/NVIDIA/NemoClaw" rel="noreferer noopener" target="_blank">NemoClaw</a> to run OpenClaw assistants, its <a class="reference external" href="https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html" rel="noreferer noopener" target="_blank">Security Best Practices</a> guide covers additional entrypoint-level controls, policy presets, provider trust tiers, and posture profiles specific to the NemoClaw blueprint.</p>
+</div>
 <section id="enforcement-layers">
 <h2>Enforcement Layers<a class="headerlink" href="#enforcement-layers" title="Link to this heading">#</a></h2>
 <p>OpenShell applies security controls at two enforcement points.
@@ -981,6 +985,7 @@ OpenShell generates a cluster CA at bootstrap and distributes it through Kuberne
 <li><p><a class="reference internal" href="../reference/default-policy.html"><span class="doc">Default Policy Reference</span></a> for the built-in default policy breakdown.</p></li>
 <li><p><a class="reference internal" href="../reference/gateway-auth.html"><span class="doc">Gateway Authentication</span></a> for gateway authentication details.</p></li>
 <li><p><a class="reference internal" href="../about/architecture.html"><span class="doc">How OpenShell Works</span></a> for the system architecture.</p></li>
+<li><p>NemoClaw <a class="reference external" href="https://docs.nvidia.com/nemoclaw/latest/security/best-practices.html" rel="noreferer noopener" target="_blank">Security Best Practices</a> for entrypoint-level controls (capability drops, PATH hardening, build toolchain removal), policy presets, provider trust tiers, and posture profiles.</p></li>
 </ul>
 </section>
 </section>
