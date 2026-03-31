@@ -517,7 +517,7 @@ a provider, attaches it to the sandbox, and launches Claude Code.</p>
 </tr>
 <tr class="row-odd"><td><p>Header value (Basic auth)</p></td>
 <td><p>Agent base64-encodes <code class="docutils literal notranslate"><span class="pre">user:&lt;placeholder&gt;</span></code> in an <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Basic</span></code> header. The proxy decodes, resolves, and re-encodes.</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Basic</span> <span class="pre">dXNlcjpvcGVuc2hlbGw6...</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Basic</span> <span class="pre">&lt;base64&gt;</span></code></p></td>
 </tr>
 <tr class="row-even"><td><p>Query parameter value</p></td>
 <td><p>Agent places the placeholder in a URL query parameter.</p></td>
