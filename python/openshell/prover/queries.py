@@ -109,10 +109,9 @@ def check_data_exfiltration(model: ReachabilityModel) -> list[Finding]:
                         l7_status = "l4_only"
                         mechanism = f"L4-only endpoint — no HTTP inspection, {bpath} can send arbitrary data"
                     else:
-                        l7_status = "l7_allows_write"
-                        mechanism = (
-                            f"L7 allows write methods — {bpath} can POST/PUT data"
-                        )
+                        # L7 is enforced and allows write — policy is
+                        # working as intended. Not a finding.
+                        continue
 
                 if cap.exfil_mechanism:
                     mechanism += f". Exfil via: {cap.exfil_mechanism}"

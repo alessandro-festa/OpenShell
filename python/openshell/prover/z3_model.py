@@ -61,10 +61,6 @@ class ReachabilityModel:
     credential_has_write: dict[str, z3.BoolRef] = field(default_factory=dict)
     # credential_has_destructive[host] = True if any credential has destructive capabilities
     credential_has_destructive: dict[str, z3.BoolRef] = field(default_factory=dict)
-    # spawns[parent:child] = True if parent spawns child
-    spawns_rel: dict[str, z3.BoolRef] = field(default_factory=dict)
-    # inherits_access[child:endpoint_key] = True if child inherits access to endpoint
-    inherits_access: dict[str, z3.BoolRef] = field(default_factory=dict)
     # filesystem_readable[path] = True
     filesystem_readable: dict[str, z3.BoolRef] = field(default_factory=dict)
 
@@ -81,7 +77,6 @@ class ReachabilityModel:
         self._encode_l7_enforcement()
         self._encode_binary_capabilities()
         self._encode_credentials()
-        self._encode_spawn_chains()
         self._encode_filesystem()
 
     def _index_endpoints(self):
@@ -191,28 +186,6 @@ class ReachabilityModel:
             self.credential_has_destructive[host] = cd_var
             self.solver.add(cd_var == has_destructive)
 
-    def _encode_spawn_chains(self):
-        """Encode binary spawn relationships and transitive access inheritance."""
-        for bpath in self.binary_paths:
-            cap = self.binary_registry.get_or_unknown(bpath)
-            for child in cap.spawns:
-                key = f"{bpath}:{child}"
-                var = z3.Bool(f"spawns_{key}")
-                self.spawns_rel[key] = var
-                self.solver.add(var == True)  # noqa: E712
-
-        # Encode transitive access inheritance
-        for bpath in self.binary_paths:
-            all_children = self.binary_registry.transitive_spawns(bpath)
-            for eid in self.endpoints:
-                parent_key = f"{bpath}:{eid.key}"
-                if parent_key in self.policy_allows:
-                    for child in all_children:
-                        inherit_key = f"{child}:{eid.key}"
-                        var = z3.Bool(f"inherits_access_{inherit_key}")
-                        self.inherits_access[inherit_key] = var
-                        self.solver.add(var == True)  # noqa: E712
-
     def _encode_filesystem(self):
         """Encode filesystem readability."""
         for path in self.policy.filesystem_policy.readable_paths:
@@ -223,15 +196,8 @@ class ReachabilityModel:
     # --- Query helpers ---
 
     def _has_access(self, bpath: str, ek: str) -> z3.BoolRef | None:
-        """Return Z3 expression for access (direct or inherited), or None."""
-        access_key = f"{bpath}:{ek}"
-        direct = self.policy_allows.get(access_key)
-        inherited = self.inherits_access.get(access_key)
-        if direct is not None and inherited is not None:
-            return z3.Or(direct, inherited)
-        if direct is not None:
-            return direct
-        return inherited  # may be None
+        """Return Z3 expression for direct policy access, or None."""
+        return self.policy_allows.get(f"{bpath}:{ek}")
 
     def can_write_to_endpoint(self, bpath: str, eid: EndpointId) -> z3.BoolRef:
         """Return a Z3 expression for whether a binary can write to an endpoint."""
