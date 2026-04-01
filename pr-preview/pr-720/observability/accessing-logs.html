@@ -460,13 +460,13 @@
 </section>
 <section id="direct-filesystem-access">
 <h2>Direct Filesystem Access<a class="headerlink" href="#direct-filesystem-access" title="Link to this heading">#</a></h2>
-<p>If you have SSH access to the sandbox, you can read the log files directly:</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>ssh<span class="w"> </span>sandbox@&lt;sandbox-host&gt;<span class="w"> </span>cat<span class="w"> </span>/var/log/openshell.2026-04-01.log
+<p>Use <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">connect</span></code> to open a shell inside the sandbox and read the log files directly:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>connect<span class="w"> </span>my-sandbox
+<span class="gp">sandbox@my-sandbox:~$ </span>cat<span class="w"> </span>/var/log/openshell.2026-04-01.log
 </pre></div>
 </div>
-<p>Or through the OpenShell SSH config:</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>ssh<span class="w"> </span>-F<span class="w"> </span>&lt;<span class="o">(</span>openshell<span class="w"> </span>sandbox<span class="w"> </span>ssh-config<span class="w"> </span>smoke-l4<span class="o">)</span><span class="w"> </span>openshell-smoke-l4<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span><span class="s2">&quot;cat /var/log/openshell.2026-04-01.log&quot;</span>
+<p>You can also run a one-off command without an interactive shell:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>connect<span class="w"> </span>my-sandbox<span class="w"> </span>--<span class="w"> </span>cat<span class="w"> </span>/var/log/openshell.2026-04-01.log
 </pre></div>
 </div>
 <p>The log files inside the sandbox contain the complete record, including events that may have been dropped from the gRPC push channel under load (the push channel is bounded and drops events rather than blocking).</p>
