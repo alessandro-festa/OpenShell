@@ -438,16 +438,16 @@
 <h2>Enable JSON Export<a class="headerlink" href="#enable-json-export" title="Link to this heading">#</a></h2>
 <p>Use the <code class="docutils literal notranslate"><span class="pre">ocsf_json_enabled</span></code> setting to toggle JSON export. The setting can be applied globally (all sandboxes) or per-sandbox.</p>
 <p>Global:</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>settings<span class="w"> </span><span class="nb">set</span><span class="w"> </span>--global<span class="w"> </span>ocsf_json_enabled<span class="w"> </span><span class="nb">true</span>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>settings<span class="w"> </span><span class="nb">set</span><span class="w"> </span>--global<span class="w"> </span>--key<span class="w"> </span>ocsf_json_enabled<span class="w"> </span>--value<span class="w"> </span><span class="nb">true</span>
 </pre></div>
 </div>
 <p>Per-sandbox:</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>settings<span class="w"> </span><span class="nb">set</span><span class="w"> </span>--sandbox<span class="w"> </span>smoke-l4<span class="w"> </span>ocsf_json_enabled<span class="w"> </span><span class="nb">true</span>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>settings<span class="w"> </span><span class="nb">set</span><span class="w"> </span>my-sandbox<span class="w"> </span>--key<span class="w"> </span>ocsf_json_enabled<span class="w"> </span>--value<span class="w"> </span><span class="nb">true</span>
 </pre></div>
 </div>
 <p>The setting takes effect on the next poll cycle (default: 10 seconds). No sandbox restart is required.</p>
 <p>To disable:</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>settings<span class="w"> </span><span class="nb">set</span><span class="w"> </span>--global<span class="w"> </span>ocsf_json_enabled<span class="w"> </span><span class="nb">false</span>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>settings<span class="w"> </span><span class="nb">set</span><span class="w"> </span>--global<span class="w"> </span>--key<span class="w"> </span>ocsf_json_enabled<span class="w"> </span>--value<span class="w"> </span><span class="nb">false</span>
 </pre></div>
 </div>
 </section>
