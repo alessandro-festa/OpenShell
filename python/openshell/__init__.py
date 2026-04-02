@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
-import contextlib
+import logging
+import warnings
 
-# Proto stubs may not be generated yet (requires Rust build).
-# Suppress so subpackages like openshell.prover can still be imported.
-with contextlib.suppress(ImportError):
+_log = logging.getLogger(__name__)
+
+try:
     from .sandbox import (  # noqa: F401 — intentional re-exports
         ClusterInferenceConfig,
         ExecChunk,
@@ -22,6 +23,16 @@ with contextlib.suppress(ImportError):
         SandboxSession,
         TlsConfig,
     )
+except ImportError as _err:
+    _msg = str(_err)
+    if "proto" in _msg or "grpc" in _msg or "_pb2" in _msg:
+        _log.debug("SDK symbols unavailable (proto stubs not generated): %s", _err)
+    else:
+        warnings.warn(
+            f"openshell SDK symbols could not be imported: {_err}",
+            ImportWarning,
+            stacklevel=2,
+        )
 
 try:
     from importlib.metadata import version
