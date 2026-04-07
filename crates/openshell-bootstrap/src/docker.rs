@@ -596,17 +596,29 @@ pub async fn ensure_container(
         }
     }
 
-    // On Tegra platforms the nvidia runtime or CDI spec generation reads
-    // host-file injection config from
+    // On Tegra platforms (Jetson) the NVIDIA container toolkit and CDI spec
+    // generation reads host-file injection config from
     // /etc/nvidia-container-runtime/host-files-for-container.d on the host.
-    // Bind-mount that directory (read-only) into the gateway so the same
-    // nvidia runtime or CDI spec generation running inside k3s (for sandbox
-    // pods) can apply the same config.
-    const HOST_FILES_DIR: &str = "/etc/nvidia-container-runtime/host-files-for-container.d";
-    if std::path::Path::new(HOST_FILES_DIR).is_dir() {
-        let mut binds = host_config.binds.take().unwrap_or_default();
-        binds.push(format!("{HOST_FILES_DIR}:{HOST_FILES_DIR}:ro"));
-        host_config.binds = Some(binds);
+    // Without this bind mount, the device plugin inside k3s cannot discover
+    // Tegra GPU devices and fails with "CDI options are only supported on
+    // NVML-based systems".
+    //
+    // We detect Tegra by querying the Docker daemon's kernel version (which
+    // works for both local and remote/SSH deploys) rather than checking the
+    // local filesystem.
+    if !device_ids.is_empty() {
+        let info = docker.info().await.into_diagnostic()?;
+        let is_tegra = info
+            .kernel_version
+            .as_deref()
+            .map_or(false, |k| k.contains("tegra"));
+        if is_tegra {
+            const HOST_FILES_DIR: &str =
+                "/etc/nvidia-container-runtime/host-files-for-container.d";
+            let mut binds = host_config.binds.take().unwrap_or_default();
+            binds.push(format!("{HOST_FILES_DIR}:{HOST_FILES_DIR}:ro"));
+            host_config.binds = Some(binds);
+        }
     }
 
     let mut cmd = vec![
