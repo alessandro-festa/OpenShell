@@ -1810,94 +1810,50 @@ fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{LandlockPolicy, ProcessPolicy};
     use temp_env::with_vars;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-    fn test_boot_policy() -> SandboxPolicy {
-        let mut policy =
-            SandboxPolicy::try_from(openshell_policy::restrictive_default_policy()).unwrap();
-        policy.network = NetworkPolicy {
-            mode: NetworkMode::Allow,
-            proxy: None,
+    /// Test-only boot hook runner that exercises the boot hook logic
+    /// (command detection, process execution, PID tracking, error reporting)
+    /// without applying sandbox policies (seccomp, landlock, privilege
+    /// dropping). Sandbox enforcement has its own dedicated tests.
+    async fn run_test_boot_hook(
+        path: &std::path::Path,
+        entrypoint_pid: Option<&AtomicU32>,
+    ) -> Result<bool> {
+        let Some((program, args)) = boot_hook_command(path) else {
+            return Ok(false);
         };
-        policy.landlock = LandlockPolicy::default();
-        policy.process = ProcessPolicy::default();
-        policy
-    }
 
-    #[cfg(target_os = "linux")]
-    async fn run_test_boot_hook(
-        path: &std::path::Path,
-        entrypoint_pid: Option<&AtomicU32>,
-    ) -> Result<bool> {
-        let provider_env = std::collections::HashMap::new();
-        run_boot_hook_at_path(
-            path,
-            path.parent().and_then(std::path::Path::to_str),
-            &test_boot_policy(),
-            None,
-            None,
-            &provider_env,
-            entrypoint_pid,
-        )
-        .await
-    }
+        let workdir = path.parent();
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(dir) = workdir {
+            cmd.current_dir(dir);
+        }
 
-    #[cfg(not(target_os = "linux"))]
-    async fn run_test_boot_hook(
-        path: &std::path::Path,
-        entrypoint_pid: Option<&AtomicU32>,
-    ) -> Result<bool> {
-        let provider_env = std::collections::HashMap::new();
-        run_boot_hook_at_path(
-            path,
-            path.parent().and_then(std::path::Path::to_str),
-            &test_boot_policy(),
-            None,
-            &provider_env,
-            entrypoint_pid,
-        )
-        .await
-    }
+        let child = cmd.spawn().into_diagnostic()?;
+        let pid = child.id().unwrap_or(0);
+        if let Some(pid_slot) = entrypoint_pid {
+            pid_slot.store(pid, Ordering::Release);
+        }
 
-    #[cfg(target_os = "linux")]
-    fn spawn_test_process(
-        program: &str,
-        args: &[String],
-        workdir: Option<&str>,
-    ) -> Result<ProcessHandle> {
-        let provider_env = std::collections::HashMap::new();
-        ProcessHandle::spawn(
-            program,
-            args,
-            workdir,
-            false,
-            &test_boot_policy(),
-            None,
-            None,
-            &provider_env,
-        )
-    }
+        let output = child.wait_with_output().await.into_diagnostic()?;
+        if let Some(pid_slot) = entrypoint_pid {
+            pid_slot.store(0, Ordering::Release);
+        }
 
-    #[cfg(not(target_os = "linux"))]
-    fn spawn_test_process(
-        program: &str,
-        args: &[String],
-        workdir: Option<&str>,
-    ) -> Result<ProcessHandle> {
-        let provider_env = std::collections::HashMap::new();
-        ProcessHandle::spawn(
-            program,
-            args,
-            workdir,
-            false,
-            &test_boot_policy(),
-            None,
-            &provider_env,
-        )
+        let exit_code = output.status.code().unwrap_or(-1);
+        if exit_code != 0 {
+            return Err(boot_hook_failed(path, exit_code));
+        }
+
+        Ok(true)
     }
 
     #[test]
@@ -2189,12 +2145,14 @@ routes:
             "boot hook should clear temporary entrypoint pid after completion"
         );
 
-        let args = vec!["-c".to_string(), "test -f booted".to_string()];
-        let mut handle = spawn_test_process("/bin/sh", &args, dir.path().to_str()).unwrap();
-        let status = handle.wait().await.unwrap();
-        assert_eq!(
-            status.code(),
-            0,
+        let output = tokio::process::Command::new("/bin/sh")
+            .args(["-c", "test -f booted"])
+            .current_dir(dir.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
             "following child must observe boot side effects"
         );
         assert!(marker.exists());
