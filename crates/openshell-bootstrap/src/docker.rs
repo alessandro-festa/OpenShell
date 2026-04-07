@@ -613,8 +613,11 @@ pub async fn ensure_container(
             .as_deref()
             .map_or(false, |k| k.contains("tegra"));
         if is_tegra {
-            const HOST_FILES_DIR: &str =
-                "/etc/nvidia-container-runtime/host-files-for-container.d";
+            const HOST_FILES_DIR: &str = "/etc/nvidia-container-runtime/host-files-for-container.d";
+            tracing::info!(
+                kernel_version = info.kernel_version.as_deref().unwrap_or("unknown"),
+                "Detected Tegra platform, bind-mounting {HOST_FILES_DIR} for CDI spec generation"
+            );
             let mut binds = host_config.binds.take().unwrap_or_default();
             binds.push(format!("{HOST_FILES_DIR}:{HOST_FILES_DIR}:ro"));
             host_config.binds = Some(binds);
