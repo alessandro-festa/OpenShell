@@ -249,21 +249,21 @@ fn run(cli: Cli) -> Result<i32, Box<dyn std::error::Error>> {
 
     let (gpu_enabled, vfio_device, _gpu_guard) = match cli.gpu {
         Some(ref addr) if addr != "auto" => {
-            let state = openshell_vm::gpu_passthrough::prepare_gpu_for_passthrough(Some(addr))?;
+            let state = openshell_vfio::prepare_gpu_for_passthrough(Some(addr))?;
             let bdf = state.pci_addr.clone();
             (
                 true,
                 Some(bdf),
-                Some(openshell_vm::gpu_passthrough::GpuBindGuard::new(state)),
+                Some(openshell_vfio::GpuBindGuard::new(state)),
             )
         }
         Some(_) => {
-            let state = openshell_vm::gpu_passthrough::prepare_gpu_for_passthrough(None)?;
+            let state = openshell_vfio::prepare_gpu_for_passthrough(None)?;
             let bdf = state.pci_addr.clone();
             (
                 true,
                 Some(bdf),
-                Some(openshell_vm::gpu_passthrough::GpuBindGuard::new(state)),
+                Some(openshell_vfio::GpuBindGuard::new(state)),
             )
         }
         None => (false, None, None),

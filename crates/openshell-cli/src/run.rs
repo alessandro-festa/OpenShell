@@ -1434,7 +1434,7 @@ pub async fn gateway_admin_deploy(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: Vec<String>,
-) -> Result<Option<openshell_vm::gpu_passthrough::GpuBindGuard>> {
+) -> Result<Option<openshell_vfio::GpuBindGuard>> {
     let (gpu, gpu_guard) = prepare_gateway_deploy_gpu(gpu, remote.as_deref())?;
 
     let location = if remote.is_some() { "remote" } else { "local" };
@@ -5250,10 +5250,7 @@ fn looks_like_pci_bdf(s: &str) -> bool {
 fn prepare_gateway_deploy_gpu(
     gpu: Vec<String>,
     remote: Option<&str>,
-) -> Result<(
-    Vec<String>,
-    Option<openshell_vm::gpu_passthrough::GpuBindGuard>,
-)> {
+) -> Result<(Vec<String>, Option<openshell_vfio::GpuBindGuard>)> {
     if gpu.is_empty() {
         return Ok((gpu, None));
     }
@@ -5295,8 +5292,8 @@ fn prepare_gateway_deploy_gpu(
 }
 
 /// Bind a GPU for VFIO passthrough and return an RAII guard that restores it on drop.
-fn check_gpu_readiness(gpu: &[String]) -> Result<openshell_vm::gpu_passthrough::GpuBindGuard> {
-    use openshell_vm::gpu_passthrough::{GpuBindGuard, prepare_gpu_for_passthrough};
+fn check_gpu_readiness(gpu: &[String]) -> Result<openshell_vfio::GpuBindGuard> {
+    use openshell_vfio::{GpuBindGuard, prepare_gpu_for_passthrough};
 
     let requested_addr = gpu
         .first()

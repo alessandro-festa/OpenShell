@@ -6,7 +6,7 @@
 //! Gated by `OPENSHELL_VM_GPU_E2E=1`. On machines without a real GPU,
 //! all tests early-return and pass.
 
-use openshell_vm::gpu_passthrough::{
+use openshell_vfio::{
     GpuBindGuard, HostNvidiaVfioReadiness, prepare_gpu_for_passthrough,
     probe_host_nvidia_vfio_readiness,
 };
@@ -22,7 +22,7 @@ fn nvidia_gpu_passthrough_is_available() {
         return;
     }
     assert!(
-        openshell_vm::gpu_passthrough::nvidia_gpu_available_for_vm_passthrough(),
+        openshell_vfio::nvidia_gpu_available_for_vm_passthrough(None),
         "GPU passthrough gate returned false on a GPU CI runner — \
          check VFIO binding and cloud-hypervisor runtime bundle"
     );

@@ -956,7 +956,9 @@ fn teardown_chv_host_networking(original_ip_forward: &str) {
     if original_ip_forward != "1" {
         let _ = std::fs::write("/proc/sys/net/ipv4/ip_forward", original_ip_forward);
     }
-    eprintln!("host networking: cleaned up iptables rules, restored ip_forward={original_ip_forward}");
+    eprintln!(
+        "host networking: cleaned up iptables rules, restored ip_forward={original_ip_forward}"
+    );
 }
 
 /// Start a background TCP proxy that forwards `127.0.0.1:{host_port}`

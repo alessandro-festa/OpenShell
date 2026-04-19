@@ -18,7 +18,6 @@ pub mod backend;
 mod embedded;
 mod exec;
 mod ffi;
-pub mod gpu_passthrough;
 mod health;
 
 use std::ffi::CString;
@@ -54,9 +53,12 @@ pub enum VmError {
          The --gpu flag requires a rootfs built with GPU support (NVIDIA drivers,\n\
          nvidia-container-toolkit, and GPU manifests).\n\
          Build one with:\n\
-         \x20 ./crates/openshell-vm/scripts/build-rootfs.sh --gpu <output_dir>\n\
-         Then either:\n\
-         \x20 - Copy it to: {path}\n\
+         \x20 mise run vm:rootfs -- --base --gpu\n\
+         \x20 mise run vm:build\n\
+         Or manually:\n\
+         \x20 - Place rootfs-gpu.tar.zst in the openshell-vm.runtime/ sidecar directory\n\
+         \x20 - Or set OPENSHELL_VM_GPU_ROOTFS_TARBALL=/path/to/rootfs-gpu.tar.zst\n\
+         \x20 - Or copy the extracted rootfs to: {path}\n\
          \x20 - Or use: openshell-vm --gpu --rootfs <path>"
     )]
     GpuRootfsNotFound { path: String },
@@ -338,16 +340,108 @@ pub fn named_gpu_rootfs_dir(instance_name: &str) -> Result<PathBuf, VmError> {
 
 /// Ensure a GPU rootfs exists for the named instance.
 ///
-/// Unlike [`ensure_named_rootfs`], there is no embedded GPU rootfs to
-/// extract — the user must pre-build it with `build-rootfs.sh --gpu`.
+/// When the GPU rootfs directory doesn't exist, looks for a
+/// `rootfs-gpu.tar.zst` tarball in these locations (in order):
+///
+/// 1. Sidecar runtime dir: `<binary_dir>/openshell-vm.runtime/rootfs-gpu.tar.zst`
+/// 2. Environment variable: `OPENSHELL_VM_GPU_ROOTFS_TARBALL`
+///
+/// If found, extracts to the instance `rootfs-gpu` path. This mirrors the
+/// pattern used by [`ensure_named_rootfs`] for the standard rootfs.
+///
+/// Validates that the rootfs contains the `.rootfs-gpu` sentinel written
+/// by `build-rootfs.sh --gpu`, catching the case where a regular rootfs
+/// was accidentally placed at the `rootfs-gpu` path.
 pub fn ensure_gpu_rootfs(instance_name: &str) -> Result<PathBuf, VmError> {
     let gpu_rootfs = named_gpu_rootfs_dir(instance_name)?;
-    if gpu_rootfs.is_dir() {
-        return Ok(gpu_rootfs);
+    if !gpu_rootfs.is_dir() {
+        if let Some(tarball) = find_gpu_rootfs_tarball() {
+            extract_gpu_rootfs_tarball(&tarball, &gpu_rootfs)?;
+        } else {
+            return Err(VmError::GpuRootfsNotFound {
+                path: gpu_rootfs.display().to_string(),
+            });
+        }
     }
-    Err(VmError::GpuRootfsNotFound {
-        path: gpu_rootfs.display().to_string(),
-    })
+
+    let sentinel = gpu_rootfs.join("opt/openshell/.rootfs-gpu");
+    if !sentinel.is_file() {
+        return Err(VmError::GpuRootfsNotFound {
+            path: format!(
+                "{} (directory exists but missing .rootfs-gpu sentinel — \
+                 was it built with --gpu?)",
+                gpu_rootfs.display()
+            ),
+        });
+    }
+
+    eprintln!("GPU rootfs: {}", gpu_rootfs.display());
+    Ok(gpu_rootfs)
+}
+
+const GPU_ROOTFS_TARBALL_ENV: &str = "OPENSHELL_VM_GPU_ROOTFS_TARBALL";
+const GPU_ROOTFS_TARBALL_NAME: &str = "rootfs-gpu.tar.zst";
+
+/// Search for a GPU rootfs tarball in known locations.
+fn find_gpu_rootfs_tarball() -> Option<PathBuf> {
+    // 1. Sidecar runtime dir next to the binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let sidecar = exe_dir
+                .join("openshell-vm.runtime")
+                .join(GPU_ROOTFS_TARBALL_NAME);
+            if sidecar.is_file() {
+                return Some(sidecar);
+            }
+        }
+    }
+
+    // 2. Environment variable override
+    if let Some(path) = std::env::var_os(GPU_ROOTFS_TARBALL_ENV) {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// Extract a `rootfs-gpu.tar.zst` tarball into the given destination directory.
+fn extract_gpu_rootfs_tarball(tarball: &Path, dest: &Path) -> Result<(), VmError> {
+    eprintln!(
+        "Extracting GPU rootfs...\n  source: {}\n  dest:   {}",
+        tarball.display(),
+        dest.display()
+    );
+
+    let file = std::fs::File::open(tarball).map_err(|e| {
+        VmError::HostSetup(format!(
+            "open GPU rootfs tarball {}: {e}",
+            tarball.display()
+        ))
+    })?;
+
+    let decoder = zstd::Decoder::new(std::io::BufReader::new(file)).map_err(|e| {
+        VmError::HostSetup(format!(
+            "create zstd decoder for {}: {e}",
+            tarball.display()
+        ))
+    })?;
+
+    std::fs::create_dir_all(dest).map_err(|e| {
+        VmError::HostSetup(format!("create GPU rootfs dir {}: {e}", dest.display()))
+    })?;
+
+    let mut archive = tar::Archive::new(decoder);
+    archive.unpack(dest).map_err(|e| {
+        // Clean up partial extraction
+        let _ = std::fs::remove_dir_all(dest);
+        VmError::HostSetup(format!("extract GPU rootfs tarball: {e}"))
+    })?;
+
+    eprintln!("  GPU rootfs extracted to {}", dest.display());
+    Ok(())
 }
 
 /// Ensure a named instance rootfs exists, extracting from the embedded

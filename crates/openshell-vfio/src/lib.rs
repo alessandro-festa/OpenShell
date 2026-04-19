@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Host-side NVIDIA GPU VFIO readiness probing for VM passthrough.
+//! Host-side NVIDIA GPU VFIO bind/unbind for VM passthrough.
+
+#![allow(unsafe_code)]
 //!
 //! This module scans Linux sysfs (`/sys/bus/pci/devices`) for NVIDIA GPUs
 //! (vendor ID `0x10de`), checks their driver binding, and verifies IOMMU
@@ -74,6 +76,25 @@ const NVIDIA_VENDOR_ID: &str = "0x10de";
 #[cfg(target_os = "linux")]
 const SYSFS_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Reject sysfs data containing characters outside the safe set for shell
+/// interpolation. All legitimate sysfs writes in this crate use PCI BDF
+/// addresses, driver names, or single digits — this blocks anything else.
+#[cfg(target_os = "linux")]
+fn validate_sysfs_data(data: &str) -> Result<(), std::io::Error> {
+    if data.is_empty()
+        || data
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b':')
+    {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("sysfs data contains unexpected characters: {data:?}"),
+        ))
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn sysfs_write_with_timeout(
     path: &std::path::Path,
@@ -82,6 +103,8 @@ fn sysfs_write_with_timeout(
 ) -> Result<(), std::io::Error> {
     use std::process::{Command, Stdio};
     use std::thread;
+
+    validate_sysfs_data(data)?;
 
     let mut child = Command::new("sh")
         .arg("-c")
@@ -163,6 +186,50 @@ fn sysfs_write_with_timeout(
     }
 }
 
+/// Check whether a PCI device supports MSI-X by walking the PCI capability
+/// list in the sysfs `config` file. MSI-X is capability ID `0x11`.
+///
+/// cloud-hypervisor's VFIO code assumes MSI-X and will panic if the device
+/// only has MSI. This pre-flight check prevents a cryptic crash.
+#[cfg(target_os = "linux")]
+pub fn check_msix_support(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
+    let config_path = sysfs.sys_bus_pci_devices().join(pci_addr).join("config");
+    let config = match std::fs::read(&config_path) {
+        Ok(data) => data,
+        Err(_) => return false,
+    };
+
+    // PCI config space: capability pointer at offset 0x34.
+    if config.len() < 0x35 {
+        return false;
+    }
+
+    // Status register (offset 0x06, bit 4) indicates capability list present.
+    if config.len() > 0x07 && (config[0x06] & 0x10) == 0 {
+        return false;
+    }
+
+    // PCI spec: capability pointers are DWORD-aligned (low 2 bits reserved).
+    let mut cap_ptr = (config[0x34] & 0xFC) as usize;
+    // Walk the capability linked list (max 48 iterations to avoid infinite loops).
+    for _ in 0..48 {
+        if cap_ptr == 0 || cap_ptr + 1 >= config.len() {
+            break;
+        }
+        let cap_id = config[cap_ptr];
+        if cap_id == 0x11 {
+            return true;
+        }
+        cap_ptr = (config[cap_ptr + 1] & 0xFC) as usize;
+    }
+    false
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn check_msix_support(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
+    false
+}
+
 /// Validates that `addr` matches the PCI BDF format `DDDD:BB:DD.F`.
 fn validate_pci_addr(addr: &str) -> Result<(), std::io::Error> {
     let bytes = addr.as_bytes();
@@ -173,7 +240,8 @@ fn validate_pci_addr(addr: &str) -> Result<(), std::io::Error> {
         && bytes[..4].iter().all(|b| b.is_ascii_hexdigit())
         && bytes[5..7].iter().all(|b| b.is_ascii_hexdigit())
         && bytes[8..10].iter().all(|b| b.is_ascii_hexdigit())
-        && bytes[11].is_ascii_digit();
+        && bytes[11] >= b'0'
+        && bytes[11] <= b'7';
     if valid {
         Ok(())
     } else {
@@ -278,8 +346,8 @@ fn probe_linux_sysfs() -> Vec<(String, HostNvidiaVfioReadiness)> {
 ///
 /// When activated, checks two conditions:
 /// 1. At least one NVIDIA device reports [`VfioBoundReady`].
-/// 2. The cloud-hypervisor binary exists in the runtime bundle.
-pub fn nvidia_gpu_available_for_vm_passthrough() -> bool {
+/// 2. The cloud-hypervisor binary exists in `runtime_dir` (if provided).
+pub fn nvidia_gpu_available_for_vm_passthrough(runtime_dir: Option<PathBuf>) -> bool {
     if std::env::var("OPENSHELL_VM_GPU_E2E").as_deref() != Ok("1") {
         return false;
     }
@@ -292,16 +360,14 @@ pub fn nvidia_gpu_available_for_vm_passthrough() -> bool {
         return false;
     }
 
-    let chv_exists = crate::configured_runtime_dir()
+    runtime_dir
         .map(|dir| dir.join("cloud-hypervisor").is_file())
-        .unwrap_or(false);
-
-    chv_exists
+        .unwrap_or(false)
 }
 
 /// Sysfs root path, defaulting to "/" in production and a temp dir in tests.
 #[derive(Debug, Clone)]
-pub(crate) struct SysfsRoot(PathBuf);
+pub struct SysfsRoot(PathBuf);
 
 impl Default for SysfsRoot {
     fn default() -> Self {
@@ -352,7 +418,7 @@ impl SysfsRoot {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn check_display_attached(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
+pub fn check_display_attached(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
     use std::fs;
 
     let drm_dir = sysfs.sys_class_drm();
@@ -403,7 +469,7 @@ pub(crate) fn check_display_attached(sysfs: &SysfsRoot, pci_addr: &str) -> bool 
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn check_display_attached(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
+pub fn check_display_attached(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
     false
 }
 
@@ -411,7 +477,7 @@ pub(crate) fn check_display_attached(_sysfs: &SysfsRoot, _pci_addr: &str) -> boo
 /// Checks whether any process on the host has an open handle to an NVIDIA GPU
 /// device (`/dev/nvidia*`). This is a host-wide check across ALL NVIDIA GPUs,
 /// not scoped to a single PCI address. Returns a list of (pid, comm) pairs.
-pub(crate) fn check_active_gpu_processes() -> std::io::Result<Vec<(u32, String)>> {
+pub fn check_active_gpu_processes() -> std::io::Result<Vec<(u32, String)>> {
     use std::fs;
 
     let mut result = Vec::new();
@@ -459,12 +525,12 @@ pub(crate) fn check_active_gpu_processes() -> std::io::Result<Vec<(u32, String)>
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn check_active_gpu_processes() -> std::io::Result<Vec<(u32, String)>> {
+pub fn check_active_gpu_processes() -> std::io::Result<Vec<(u32, String)>> {
     Ok(vec![])
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn check_iommu_enabled(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
+pub fn check_iommu_enabled(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
     let iommu_groups = sysfs.sys_kernel_iommu_groups();
     if !iommu_groups.is_dir() {
         return false;
@@ -477,22 +543,22 @@ pub(crate) fn check_iommu_enabled(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn check_iommu_enabled(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
+pub fn check_iommu_enabled(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
     false
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn check_vfio_modules_loaded(sysfs: &SysfsRoot) -> bool {
+pub fn check_vfio_modules_loaded(sysfs: &SysfsRoot) -> bool {
     sysfs.sys_module("vfio_pci").is_dir() && sysfs.sys_module("vfio_iommu_type1").is_dir()
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn check_vfio_modules_loaded(_sysfs: &SysfsRoot) -> bool {
+pub fn check_vfio_modules_loaded(_sysfs: &SysfsRoot) -> bool {
     false
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn check_sysfs_permissions(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
+pub fn check_sysfs_permissions(sysfs: &SysfsRoot, pci_addr: &str) -> bool {
     use nix::unistd::{AccessFlags, access};
 
     let dev_dir = sysfs.sys_bus_pci_devices().join(pci_addr);
@@ -507,12 +573,12 @@ pub(crate) fn check_sysfs_permissions(sysfs: &SysfsRoot, pci_addr: &str) -> bool
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn check_sysfs_permissions(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
+pub fn check_sysfs_permissions(_sysfs: &SysfsRoot, _pci_addr: &str) -> bool {
     false
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn current_driver(sysfs: &SysfsRoot, pci_addr: &str) -> Option<String> {
+pub fn current_driver(sysfs: &SysfsRoot, pci_addr: &str) -> Option<String> {
     let driver_link = sysfs.sys_bus_pci_devices().join(pci_addr).join("driver");
     std::fs::read_link(&driver_link)
         .ok()
@@ -520,7 +586,7 @@ pub(crate) fn current_driver(sysfs: &SysfsRoot, pci_addr: &str) -> Option<String
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn current_driver(_sysfs: &SysfsRoot, _pci_addr: &str) -> Option<String> {
+pub fn current_driver(_sysfs: &SysfsRoot, _pci_addr: &str) -> Option<String> {
     None
 }
 
@@ -623,11 +689,52 @@ fn nvidia_pre_unbind_prep(pci_addr: &str) {
     }
 }
 
+/// Reload nvidia kernel modules so the driver's sysfs bind file exists.
+///
+/// Called during restore to ensure `modprobe nvidia` brings back the driver
+/// that `nvidia_pre_unbind_prep` may have unloaded. Loads the base `nvidia`
+/// module plus its dependent submodules in the correct order.
 #[cfg(target_os = "linux")]
-pub(crate) fn bind_gpu_to_vfio(
-    sysfs: &SysfsRoot,
-    pci_addr: &str,
-) -> Result<String, std::io::Error> {
+fn nvidia_reload_modules() {
+    use std::process::{Command, Stdio};
+
+    // Load in dependency order: base module first, then dependents.
+    // If the base "nvidia" module fails, skip submodules (they depend on it).
+    for (i, module) in ["nvidia", "nvidia_modeset", "nvidia_uvm", "nvidia_drm"]
+        .iter()
+        .enumerate()
+    {
+        let mut cmd = Command::new("modprobe");
+        cmd.arg(module)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        match run_with_timeout(cmd, NVIDIA_PREP_TIMEOUT) {
+            Some(s) if s.success() => {
+                eprintln!("GPU: loaded {module} for restore");
+            }
+            None => {
+                eprintln!(
+                    "GPU: modprobe {module} timed out after {:.0}s during restore",
+                    NVIDIA_PREP_TIMEOUT.as_secs_f64()
+                );
+                break;
+            }
+            Some(s) => {
+                eprintln!(
+                    "GPU: modprobe {module} exited {} during restore (non-fatal)",
+                    s.code().unwrap_or(-1)
+                );
+                if i == 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn bind_gpu_to_vfio(sysfs: &SysfsRoot, pci_addr: &str) -> Result<String, std::io::Error> {
     validate_pci_addr(pci_addr)?;
     let drv = current_driver(sysfs, pci_addr);
 
@@ -736,19 +843,36 @@ pub(crate) fn bind_gpu_to_vfio(
         ));
     }
 
-    Ok(drv.unwrap_or_default())
+    // When the device had no driver (e.g. nvidia modules were already unloaded
+    // from a previous crash), infer "nvidia" from the vendor ID so the restore
+    // path knows which driver to rebind to.
+    let original = match drv {
+        Some(d) if !d.is_empty() => d,
+        _ => {
+            let vendor = std::fs::read_to_string(dev_dir.join("vendor"))
+                .map(|v| v.trim().to_lowercase())
+                .unwrap_or_default();
+            if vendor == NVIDIA_VENDOR_ID {
+                eprintln!(
+                    "GPU {pci_addr}: no driver was bound, defaulting restore target to nvidia"
+                );
+                "nvidia".to_string()
+            } else {
+                String::new()
+            }
+        }
+    };
+
+    Ok(original)
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn bind_gpu_to_vfio(
-    _sysfs: &SysfsRoot,
-    _pci_addr: &str,
-) -> Result<String, std::io::Error> {
+pub fn bind_gpu_to_vfio(_sysfs: &SysfsRoot, _pci_addr: &str) -> Result<String, std::io::Error> {
     Ok(String::new())
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn rebind_gpu_to_original(
+pub fn rebind_gpu_to_original(
     sysfs: &SysfsRoot,
     pci_addr: &str,
     original_driver: &str,
@@ -791,21 +915,39 @@ pub(crate) fn rebind_gpu_to_original(
     })?;
 
     if !original_driver.is_empty() && original_driver != "none" {
+        // The nvidia driver bind path requires the kernel module to be loaded.
+        // nvidia_pre_unbind_prep may have unloaded it (cascade from submodules),
+        // or it may have been absent since before we started. Reload it so the
+        // driver's bind file exists in sysfs.
+        if original_driver == "nvidia" && sysfs.is_real_sysfs() {
+            nvidia_reload_modules();
+        }
+
         let bind = sysfs.sys_bus_pci_drivers(original_driver).join("bind");
-        sysfs.write_sysfs(&bind, pci_addr).map_err(|e| {
-            let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
-                " — run as root"
-            } else {
-                ""
-            };
-            std::io::Error::new(
-                e.kind(),
-                format!(
-                    "Failed to rebind to {original_driver} at {path}{hint}",
-                    path = bind.display()
-                ),
-            )
-        })?;
+        if let Err(e) = sysfs.write_sysfs(&bind, pci_addr) {
+            eprintln!(
+                "GPU {pci_addr}: explicit bind to {original_driver} failed ({e}), \
+                 falling back to PCI rescan"
+            );
+            let rescan = sysfs.0.join("sys/bus/pci/rescan");
+            let _ = sysfs.write_sysfs(&rescan, "1");
+            // Give the kernel time to re-probe and bind drivers.
+            std::thread::sleep(Duration::from_secs(1));
+
+            if current_driver(sysfs, pci_addr).is_none() {
+                return Err(std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to restore {pci_addr} to {original_driver}: \
+                         explicit bind and PCI rescan both failed. \
+                         Manual fix: sudo modprobe nvidia && echo {pci_addr} | \
+                         sudo tee /sys/bus/pci/drivers/nvidia/bind"
+                    ),
+                ));
+            }
+            let new_drv = current_driver(sysfs, pci_addr).unwrap_or_default();
+            eprintln!("GPU {pci_addr}: PCI rescan bound device to {new_drv}");
+        }
     } else {
         let rescan = sysfs.0.join("sys/bus/pci/rescan");
         let _ = sysfs.write_sysfs(&rescan, "1");
@@ -815,7 +957,7 @@ pub(crate) fn rebind_gpu_to_original(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn rebind_gpu_to_original(
+pub fn rebind_gpu_to_original(
     _sysfs: &SysfsRoot,
     _pci_addr: &str,
     _original_driver: &str,
@@ -824,10 +966,7 @@ pub(crate) fn rebind_gpu_to_original(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn iommu_group_peers(
-    sysfs: &SysfsRoot,
-    pci_addr: &str,
-) -> Result<Vec<String>, std::io::Error> {
+pub fn iommu_group_peers(sysfs: &SysfsRoot, pci_addr: &str) -> Result<Vec<String>, std::io::Error> {
     validate_pci_addr(pci_addr)?;
     let iommu_devices = sysfs
         .sys_bus_pci_devices()
@@ -851,7 +990,7 @@ pub(crate) fn iommu_group_peers(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn iommu_group_peers(
+pub fn iommu_group_peers(
     _sysfs: &SysfsRoot,
     _pci_addr: &str,
 ) -> Result<Vec<String>, std::io::Error> {
@@ -859,7 +998,7 @@ pub(crate) fn iommu_group_peers(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn bind_iommu_group_peers(
+pub fn bind_iommu_group_peers(
     sysfs: &SysfsRoot,
     pci_addr: &str,
 ) -> Result<Vec<(String, String)>, std::io::Error> {
@@ -890,7 +1029,7 @@ pub(crate) fn bind_iommu_group_peers(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn bind_iommu_group_peers(
+pub fn bind_iommu_group_peers(
     _sysfs: &SysfsRoot,
     _pci_addr: &str,
 ) -> Result<Vec<(String, String)>, std::io::Error> {
@@ -898,7 +1037,7 @@ pub(crate) fn bind_iommu_group_peers(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn rebind_iommu_group_peers(
+pub fn rebind_iommu_group_peers(
     sysfs: &SysfsRoot,
     peers: &[(String, String)],
 ) -> Result<(), std::io::Error> {
@@ -917,7 +1056,7 @@ pub(crate) fn rebind_iommu_group_peers(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn rebind_iommu_group_peers(
+pub fn rebind_iommu_group_peers(
     _sysfs: &SysfsRoot,
     _peers: &[(String, String)],
 ) -> Result<(), std::io::Error> {
@@ -959,17 +1098,28 @@ impl GpuBindState {
         self.restore_with_sysfs(&SysfsRoot::default())
     }
 
-    pub(crate) fn restore_with_sysfs(&self, sysfs: &SysfsRoot) -> Result<(), std::io::Error> {
+    pub fn restore_with_sysfs(&self, sysfs: &SysfsRoot) -> Result<(), std::io::Error> {
         if !self.did_bind {
             return Ok(());
         }
+
+        // Always attempt peer restore even if GPU restore fails, so the
+        // audio companion (and any other IOMMU group peers) aren't left
+        // stranded on vfio-pci.
         eprintln!(
             "GPU: rebinding {} to {}",
             self.pci_addr, self.original_driver
         );
-        rebind_gpu_to_original(sysfs, &self.pci_addr, &self.original_driver)?;
-        rebind_iommu_group_peers(sysfs, &self.peer_binds)?;
-        Ok(())
+        let gpu_result = rebind_gpu_to_original(sysfs, &self.pci_addr, &self.original_driver);
+        let peer_result = rebind_iommu_group_peers(sysfs, &self.peer_binds);
+
+        if let Err(ref gpu_err) = gpu_result {
+            if let Err(ref peer_err) = peer_result {
+                eprintln!("GPU: peer restore also failed: {peer_err}");
+            }
+            return Err(std::io::Error::new(gpu_err.kind(), gpu_err.to_string()));
+        }
+        peer_result
     }
 }
 
@@ -1024,7 +1174,7 @@ pub fn prepare_gpu_for_passthrough(
     prepare_gpu_with_sysfs(&SysfsRoot::default(), requested_bdf)
 }
 
-pub(crate) fn prepare_gpu_with_sysfs(
+pub fn prepare_gpu_with_sysfs(
     sysfs: &SysfsRoot,
     requested_bdf: Option<&str>,
 ) -> Result<GpuBindState, std::io::Error> {
@@ -1061,6 +1211,17 @@ fn prepare_specific_gpu(sysfs: &SysfsRoot, bdf: &str) -> Result<GpuBindState, st
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!("PCI device {bdf} is not a GPU (class: {class})"),
+        ));
+    }
+
+    if !check_msix_support(sysfs, bdf) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "GPU {bdf}: device does not support MSI-X (only MSI). \
+                 cloud-hypervisor requires MSI-X for VFIO passthrough. \
+                 This is a hardware/firmware limitation of this GPU model."
+            ),
         ));
     }
 
@@ -1185,6 +1346,14 @@ fn prepare_auto_gpu(sysfs: &SysfsRoot) -> Result<GpuBindState, std::io::Error> {
         .map_err(|e| std::io::Error::new(e.kind(), format!("cannot verify GPUs are idle — {e}")))?;
 
     for addr in &nvidia_addrs {
+        if !check_msix_support(sysfs, addr) {
+            blocked.push((
+                addr.clone(),
+                "no MSI-X support (required by cloud-hypervisor)".to_string(),
+            ));
+            continue;
+        }
+
         if current_driver(sysfs, addr).as_deref() == Some("vfio-pci") {
             blocked.push((addr.clone(), "IOMMU group not clean".to_string()));
             continue;
@@ -1258,7 +1427,7 @@ mod tests {
         // SAFETY: test runs single-threaded; no other thread reads this var.
         unsafe { std::env::remove_var("OPENSHELL_VM_GPU_E2E") };
         assert!(
-            !nvidia_gpu_available_for_vm_passthrough(),
+            !nvidia_gpu_available_for_vm_passthrough(None),
             "gate must return false when OPENSHELL_VM_GPU_E2E is unset"
         );
     }
@@ -1305,12 +1474,30 @@ mod tests {
         }
     }
 
+    /// Build a minimal PCI config space (64 bytes) with a capability list
+    /// containing a single MSI-X entry (cap ID 0x11) so `check_msix_support`
+    /// sees the device as passthrough-capable.
+    fn mock_pci_config_with_msix() -> Vec<u8> {
+        let mut cfg = vec![0u8; 64];
+        // Status register (offset 0x06): set bit 4 = capabilities list present.
+        cfg[0x06] = 0x10;
+        // Capabilities pointer (offset 0x34): first cap at 0x40.
+        cfg[0x34] = 0x40;
+        // Extend to include the capability at offset 0x40.
+        cfg.resize(0x42, 0);
+        // Cap at 0x40: ID = 0x11 (MSI-X), next = 0x00 (end of list).
+        cfg[0x40] = 0x11;
+        cfg[0x41] = 0x00;
+        cfg
+    }
+
     fn mock_pci_device(root: &Path, pci_addr: &str, vendor: &str, driver: Option<&str>) {
         use std::fs;
         let dev_dir = root.join("sys/bus/pci/devices").join(pci_addr);
         fs::create_dir_all(&dev_dir).unwrap();
         fs::write(dev_dir.join("vendor"), vendor).unwrap();
         fs::write(dev_dir.join("class"), "0x030000").unwrap();
+        fs::write(dev_dir.join("config"), mock_pci_config_with_msix()).unwrap();
         if let Some(drv) = driver {
             let driver_dir = root.join("sys/bus/pci/drivers").join(drv);
             fs::create_dir_all(&driver_dir).unwrap();
@@ -1888,6 +2075,82 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sysfs = SysfsRoot::new(root.path().to_path_buf());
         state.restore_with_sysfs(&sysfs).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bind_unbound_nvidia_defaults_to_nvidia_driver() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        // Device with no driver bound (simulating post-crash state).
+        mock_pci_device(root.path(), "0000:41:00.0", "0x10de", None);
+        let vfio_dir = root.path().join("sys/bus/pci/drivers/vfio-pci");
+        fs::create_dir_all(&vfio_dir).unwrap();
+        fs::write(vfio_dir.join("bind"), "").unwrap();
+
+        let result = bind_gpu_to_vfio(&sysfs, "0000:41:00.0").unwrap();
+        assert_eq!(
+            result, "nvidia",
+            "unbound NVIDIA device should default to nvidia as restore driver"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn msix_detected_in_config() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        mock_pci_device(root.path(), "0000:41:00.0", "0x10de", None);
+        assert!(check_msix_support(&sysfs, "0000:41:00.0"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn msix_absent_msi_only() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        let dev_dir = root.path().join("sys/bus/pci/devices").join("0000:41:00.0");
+        fs::create_dir_all(&dev_dir).unwrap();
+        // Config with MSI (cap 0x05) only, no MSI-X (0x11).
+        let mut cfg = vec![0u8; 0x42];
+        cfg[0x06] = 0x10; // capabilities list present
+        cfg[0x34] = 0x40; // cap pointer
+        cfg[0x40] = 0x05; // MSI capability
+        cfg[0x41] = 0x00; // end of list
+        fs::write(dev_dir.join("config"), &cfg).unwrap();
+        assert!(!check_msix_support(&sysfs, "0000:41:00.0"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn msix_empty_cap_list() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        let dev_dir = root.path().join("sys/bus/pci/devices").join("0000:41:00.0");
+        fs::create_dir_all(&dev_dir).unwrap();
+        let mut cfg = vec![0u8; 0x40];
+        cfg[0x06] = 0x10; // capabilities list present
+        cfg[0x34] = 0x00; // null cap pointer
+        fs::write(dev_dir.join("config"), &cfg).unwrap();
+        assert!(!check_msix_support(&sysfs, "0000:41:00.0"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn msix_circular_cap_list() {
+        let root = tempfile::tempdir().unwrap();
+        let sysfs = SysfsRoot::new(root.path().to_path_buf());
+        let dev_dir = root.path().join("sys/bus/pci/devices").join("0000:41:00.0");
+        fs::create_dir_all(&dev_dir).unwrap();
+        // Circular: cap at 0x40 points back to 0x40.
+        let mut cfg = vec![0u8; 0x42];
+        cfg[0x06] = 0x10;
+        cfg[0x34] = 0x40;
+        cfg[0x40] = 0x05; // MSI (not MSI-X)
+        cfg[0x41] = 0x40; // points back to self
+        fs::write(dev_dir.join("config"), &cfg).unwrap();
+        // Should terminate via the 48-iteration guard, not hang.
+        assert!(!check_msix_support(&sysfs, "0000:41:00.0"));
     }
 
     #[test]
