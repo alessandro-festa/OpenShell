@@ -30,9 +30,9 @@ use crate::constants::{
     SSH_HANDSHAKE_SECRET_NAME, network_name, volume_name,
 };
 use crate::docker::{
-    check_existing_gateway, check_port_conflicts, cleanup_gateway_container,
-    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
-    resolve_gpu_device_ids, start_container, stop_container,
+    check_existing_gateway, check_gateway_resources, check_port_conflicts,
+    cleanup_gateway_container, destroy_gateway_resources, ensure_container, ensure_image,
+    ensure_network, ensure_volume, resolve_gpu_device_ids, start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -252,6 +252,23 @@ pub async fn check_existing_deployment(
         preflight.docker
     };
     check_existing_gateway(&docker, name).await
+}
+
+/// Check whether any managed gateway resources with the given name exist.
+///
+/// Unlike `check_existing_deployment`, this includes the per-gateway Docker
+/// network so destroy can distinguish a real cleanup from a no-op.
+pub async fn check_existing_gateway_resources(
+    name: &str,
+    remote: Option<&RemoteOptions>,
+) -> Result<bool> {
+    let docker = if let Some(remote_opts) = remote {
+        create_ssh_docker_client(remote_opts).await?
+    } else {
+        let preflight = check_docker_available().await?;
+        preflight.docker
+    };
+    check_gateway_resources(&docker, name).await
 }
 
 pub async fn deploy_gateway(options: DeployOptions) -> Result<GatewayHandle> {

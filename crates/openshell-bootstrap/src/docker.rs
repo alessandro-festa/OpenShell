@@ -1227,6 +1227,55 @@ pub struct ExistingGatewayInfo {
     pub container_image: Option<String>,
 }
 
+fn has_managed_gateway_resources(
+    container_exists: bool,
+    volume_exists: bool,
+    network_exists: bool,
+) -> bool {
+    container_exists || volume_exists || network_exists
+}
+
+/// Check whether any managed gateway resources with the given name exist.
+///
+/// This is broader than `check_existing_gateway()`: destroy also needs to
+/// clean up the per-gateway Docker network, so a lone network still counts as
+/// an existing managed gateway resource set.
+pub async fn check_gateway_resources(docker: &Docker, name: &str) -> Result<bool> {
+    let container_name = container_name(name);
+    let volume_name = volume_name(name);
+    let network_name = network_name(name);
+
+    let volume_exists = match docker.inspect_volume(&volume_name).await {
+        Ok(_) => true,
+        Err(err) if is_not_found(&err) => false,
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    let container_exists = match docker
+        .inspect_container(&container_name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(_) => true,
+        Err(err) if is_not_found(&err) => false,
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    let network_exists = match docker
+        .inspect_network(&network_name, None::<InspectNetworkOptions>)
+        .await
+    {
+        Ok(_) => true,
+        Err(err) if is_not_found(&err) => false,
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    Ok(has_managed_gateway_resources(
+        container_exists,
+        volume_exists,
+        network_exists,
+    ))
+}
+
 /// Check whether a gateway with the given name already exists.
 ///
 /// Returns `None` if no gateway resources exist, or `Some(info)` with
@@ -1447,5 +1496,13 @@ mod tests {
             "nvidia.com/gpu=1".to_string(),
         ];
         assert_eq!(resolve_gpu_device_ids(&multi, true), multi);
+    }
+
+    #[test]
+    fn managed_gateway_resources_require_any_resource() {
+        assert!(!has_managed_gateway_resources(false, false, false));
+        assert!(has_managed_gateway_resources(true, false, false));
+        assert!(has_managed_gateway_resources(false, true, false));
+        assert!(has_managed_gateway_resources(false, false, true));
     }
 }

@@ -1640,6 +1640,14 @@ pub async fn gateway_admin_destroy(
             let remote_opts = gateway_control_target_options(name, remote, ssh_key)?;
 
             eprintln!("• Destroying gateway {name}...");
+            if !openshell_bootstrap::check_existing_gateway_resources(name, remote_opts.as_ref())
+                .await?
+            {
+                cleanup_gateway_metadata(name);
+                eprintln!("• No gateway '{name}' found.");
+                return Ok(());
+            }
+
             let handle = openshell_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
             handle.destroy().await?;
 

@@ -180,6 +180,8 @@ Permanently destroy a gateway and all its state:
 openshell gateway destroy
 ```
 
+If no managed gateway resources exist for that name, OpenShell reports that there is nothing to destroy instead of claiming a successful removal.
+
 For cloud gateways, `gateway destroy` removes only the local registration. It does not affect the remote deployment.
 
 Target a specific gateway with `--name`:
