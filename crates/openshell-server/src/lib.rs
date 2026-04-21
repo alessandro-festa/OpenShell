@@ -4,10 +4,9 @@
 //! `OpenShell` Server library.
 //!
 //! This crate provides the server implementation for `OpenShell`, including:
-//! - gRPC service implementation
-//! - HTTP health endpoints
-//! - Protocol multiplexing (gRPC + HTTP on same port)
-//! - mTLS support
+//! - gRPC services
+//! - Multiplexed gRPC/HTTP main listener and a plaintext health port
+//! - mTLS
 //!
 //! TODO(driver-abstraction): `build_compute_runtime` still switches on
 //! [`ComputeDriverKind`] and calls driver-specific constructors
@@ -119,9 +118,7 @@ impl ServerState {
     }
 }
 
-/// Run the `OpenShell` server.
-///
-/// This starts a multiplexed gRPC/HTTP server on the configured bind address.
+/// Run the `OpenShell` server (main listener and plaintext health port).
 ///
 /// # Errors
 ///
@@ -166,7 +163,6 @@ pub async fn run_server(
     state.compute.spawn_watchers();
     ssh_tunnel::spawn_session_reaper(store.clone(), Duration::from_secs(3600));
 
-    // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
 
     // Bind the TCP listener
@@ -175,6 +171,19 @@ pub async fn run_server(
         .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", config.bind_address)))?;
 
     info!(address = %config.bind_address, "Server listening");
+
+    let health_listener = TcpListener::bind(config.health_bind_address)
+        .await
+        .map_err(|e| Error::transport(format!("failed to bind to {}: {e}", config.health_bind_address)))?;
+    info!(
+        address = %config.health_bind_address,
+        "Health HTTP listener (plaintext)"
+    );
+    tokio::spawn(async move {
+        if let Err(e) = http::serve_health_listener(health_listener).await {
+            error!(error = %e, "Health HTTP server exited");
+        }
+    });
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
     let tls_acceptor = if let Some(tls) = &config.tls {

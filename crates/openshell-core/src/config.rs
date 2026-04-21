@@ -50,12 +50,23 @@ impl FromStr for ComputeDriverKind {
     }
 }
 
+/// Default TCP port for the main gRPC/HTTP gateway listener.
+pub const DEFAULT_SERVER_PORT: u16 = 8080;
+
+/// Default port for the plaintext health listener (`/health`, `/healthz`, `/readyz`).
+pub const DEFAULT_HEALTH_SERVER_PORT: u16 = 8081;
+
 /// Server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Address to bind the server to.
     #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
+
+    /// Address for the plaintext health HTTP listener (`/health`, `/healthz`, `/readyz`).
+    /// Defaults to all interfaces on port [`DEFAULT_HEALTH_SERVER_PORT`].
+    #[serde(default = "default_health_bind_address")]
+    pub health_bind_address: SocketAddr,
 
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
@@ -168,6 +179,7 @@ impl Config {
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
             bind_address: default_bind_address(),
+            health_bind_address: default_health_bind_address(),
             log_level: default_log_level(),
             tls,
             database_url: String::new(),
@@ -192,6 +204,13 @@ impl Config {
     #[must_use]
     pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
         self.bind_address = addr;
+        self
+    }
+
+    /// Set the plaintext health HTTP bind address.
+    #[must_use]
+    pub const fn with_health_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.health_bind_address = addr;
         self
     }
 
@@ -312,7 +331,11 @@ impl Config {
 }
 
 fn default_bind_address() -> SocketAddr {
-    "0.0.0.0:8080".parse().expect("valid default address")
+    SocketAddr::from(([0, 0, 0, 0], DEFAULT_SERVER_PORT))
+}
+
+fn default_health_bind_address() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], DEFAULT_HEALTH_SERVER_PORT))
 }
 
 fn default_log_level() -> String {
@@ -332,7 +355,7 @@ fn default_ssh_gateway_host() -> String {
 }
 
 const fn default_ssh_gateway_port() -> u16 {
-    8080
+    DEFAULT_SERVER_PORT
 }
 
 fn default_ssh_connect_path() -> String {
@@ -353,7 +376,8 @@ const fn default_ssh_session_ttl_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ComputeDriverKind, Config};
+    use super::{ComputeDriverKind, Config, DEFAULT_HEALTH_SERVER_PORT, DEFAULT_SERVER_PORT};
+    use std::net::SocketAddr;
 
     #[test]
     fn compute_driver_kind_parses_supported_values() {
@@ -382,6 +406,22 @@ mod tests {
         assert_eq!(
             Config::new(None).compute_drivers,
             vec![ComputeDriverKind::Kubernetes]
+        );
+    }
+
+    #[test]
+    fn config_default_bind_and_ssh_gateway_match_default_server_port() {
+        let cfg = Config::new(None);
+        assert_eq!(cfg.bind_address.port(), DEFAULT_SERVER_PORT);
+        assert_eq!(cfg.ssh_gateway_port, DEFAULT_SERVER_PORT);
+    }
+
+    #[test]
+    fn config_default_health_bind_matches_default_health_server_port() {
+        let cfg = Config::new(None);
+        assert_eq!(
+            cfg.health_bind_address,
+            SocketAddr::from(([0, 0, 0, 0], DEFAULT_HEALTH_SERVER_PORT))
         );
     }
 }

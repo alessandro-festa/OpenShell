@@ -673,17 +673,20 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
 /// Uses `serve_connection_with_upgrades` to also support WebSocket upgrades.
 #[tokio::test]
 async fn plaintext_server_accepts_grpc_and_http() {
+    use axum::http::StatusCode as AxumStatusCode;
+    use axum::{Router, routing::get};
     use openshell_core::proto::{
         HealthRequest, ServiceStatus, open_shell_client::OpenShellClient,
         open_shell_server::OpenShellServer,
     };
-    use openshell_server::{MultiplexedService, health_router};
+    use openshell_server::MultiplexedService;
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service =
+        Router::new().route("/__mux_http_probe", get(|| async { AxumStatusCode::OK }));
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let server = tokio::spawn(async move {
@@ -727,14 +730,14 @@ async fn plaintext_server_accepts_grpc_and_http() {
     });
     let req = Request::builder()
         .method("GET")
-        .uri(format!("http://{addr}/healthz"))
+        .uri(format!("http://{addr}/__mux_http_probe"))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = sender.send_request(req).await.unwrap();
     assert_eq!(
         resp.status(),
         StatusCode::OK,
-        "HTTP healthz should succeed over plaintext"
+        "HTTP probe should succeed over plaintext"
     );
 
     server.abort();

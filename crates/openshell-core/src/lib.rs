@@ -19,7 +19,9 @@ pub mod paths;
 pub mod proto;
 pub mod settings;
 
-pub use config::{ComputeDriverKind, Config, TlsConfig};
+pub use config::{
+    ComputeDriverKind, Config, DEFAULT_HEALTH_SERVER_PORT, DEFAULT_SERVER_PORT, TlsConfig,
+};
 pub use error::{Error, Result};
 
 /// Build version string derived from git metadata.

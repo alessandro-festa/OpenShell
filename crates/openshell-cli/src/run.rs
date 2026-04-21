@@ -4,16 +4,16 @@
 //! CLI command implementations.
 
 use crate::policy_update::build_policy_update_plan;
-use crate::tls::{
-    TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
-};
+use crate::tls::{TlsOptions, grpc_client, grpc_inference_client};
 use bytes::Bytes;
 use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use hyper_util::{
+    client::legacy::{Client, connect::HttpConnector},
+    rt::TokioExecutor,
+};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
@@ -22,6 +22,7 @@ use openshell_bootstrap::{
     get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
     resolve_ssh_hostname, save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
+use openshell_core::DEFAULT_HEALTH_SERVER_PORT;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
@@ -44,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use tonic::{Code, Status};
+use url::{Host, Url};
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
@@ -852,14 +854,14 @@ fn gateway_auth_label(gateway: &GatewayMetadata) -> &str {
 }
 
 fn is_loopback_gateway_endpoint(endpoint: &str) -> bool {
-    let Ok(parsed) = url::Url::parse(endpoint) else {
+    let Ok(parsed) = Url::parse(endpoint) else {
         return false;
     };
 
     match parsed.host() {
-        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
-        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
-        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(Host::Ipv6(addr)) => addr.is_loopback(),
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
         None => false,
     }
 }
@@ -981,7 +983,7 @@ pub async fn gateway_add(
                  The SSH destination is already embedded in the URL."
             ));
         }
-        let parsed = url::Url::parse(endpoint)
+        let parsed = Url::parse(endpoint)
             .map_err(|e| miette::miette!("Invalid ssh:// URL '{endpoint}': {e}"))?;
         let host = parsed
             .host_str()
@@ -1026,7 +1028,7 @@ pub async fn gateway_add(
         n
     } else {
         // Parse out just the host portion of the URL.
-        derived_name = url::Url::parse(&endpoint)
+        derived_name = Url::parse(&endpoint)
             .ok()
             .and_then(|u| u.host_str().map(String::from))
             .unwrap_or_else(|| endpoint.clone());
@@ -1078,7 +1080,7 @@ pub async fn gateway_add(
         // is not registered.  Pass the endpoint port so the container can be
         // identified by its host port binding when multiple gateways run on
         // the same Docker host.
-        let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
+        let endpoint_port = Url::parse(&endpoint).ok().and_then(|u| u.port());
         eprintln!("• Extracting TLS certificates from gateway container...");
         openshell_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
             .await?;
@@ -1252,28 +1254,35 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {
-    let base = server.trim_end_matches('/');
-    let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
+/// `GET /healthz` on `health_port`, host taken from `gateway_endpoint`.
+fn gateway_health_uri(gateway_endpoint: &str, health_port: u16) -> Result<hyper::Uri> {
+    let mut url =
+        Url::parse(gateway_endpoint.trim_end_matches('/')).map_err(|e| miette::miette!(e))?;
+    url.set_scheme("http").map_err(|_| {
+        miette::miette!("could not set health check URL scheme to http from gateway endpoint")
+    })?;
+    url.set_port(Some(health_port))
+        .map_err(|_| miette::miette!("could not set health check port on gateway endpoint URL"))?;
+    url.set_path("/healthz");
+    url.as_str()
+        .parse::<hyper::Uri>()
+        .map_err(|e| miette::miette!("invalid health check URI: {e}"))
+}
 
-    let scheme = uri.scheme_str().unwrap_or("https");
-    let https = if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
-        HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .into_diagnostic()?
-            .https_or_http()
-            .enable_http1()
-            .build()
-    } else {
-        let materials = require_tls_materials(server, tls)?;
-        let tls_config = build_rustls_config(&materials)?;
-        HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_only()
-            .enable_http1()
-            .build()
-    };
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
+async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {
+    http_health_check_on_port(server, tls, DEFAULT_HEALTH_SERVER_PORT).await
+}
+
+pub(crate) async fn http_health_check_on_port(
+    server: &str,
+    tls: &TlsOptions,
+    health_port: u16,
+) -> Result<Option<StatusCode>> {
+    let uri = gateway_health_uri(server, health_port)?;
+
+    let mut http = HttpConnector::new();
+    http.set_nodelay(true);
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(http);
     let mut req_builder = Request::builder().method("GET").uri(uri);
     // Inject edge authentication headers when an edge token is configured.
     if let Some(ref token) = tls.edge_token {
@@ -5437,7 +5446,7 @@ mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
         format_gateway_select_items, gateway_add, gateway_auth_label, gateway_select_with,
-        gateway_type_label, git_sync_files, http_health_check, image_requests_gpu,
+        gateway_type_label, git_sync_files, http_health_check_on_port, image_requests_gpu,
         inferred_provider_type, parse_cli_setting_value, parse_credential_pairs,
         plaintext_gateway_is_remote, provisioning_timeout_message, ready_false_condition_message,
         resolve_gateway_control_target_from, sandbox_should_persist, shell_escape,
@@ -6043,9 +6052,13 @@ mod tests {
                 .expect("write response");
         });
 
-        let status = http_health_check(&format!("http://{addr}"), &TlsOptions::default())
-            .await
-            .expect("health check");
+        let status = http_health_check_on_port(
+            &format!("http://127.0.0.1:1"),
+            &TlsOptions::default(),
+            addr.port(),
+        )
+        .await
+        .expect("health check");
 
         server.join().expect("server thread");
         assert_eq!(status, Some(StatusCode::OK));

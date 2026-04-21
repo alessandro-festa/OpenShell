@@ -3,7 +3,7 @@
 
 //! Shared CLI entrypoint for the gateway binaries.
 
-use clap::{Command, CommandFactory, FromArgMatches, Parser};
+use clap::{ArgAction, Args, Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use std::net::SocketAddr;
@@ -14,30 +14,96 @@ use tracing_subscriber::EnvFilter;
 use crate::compute::VmComputeConfig;
 use crate::{run_server, tracing_bus::TracingLogBus};
 
+/// TLS for the main gRPC/HTTP listener (gateway server identity and mTLS client CA).
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Server TLS")]
+struct ServerTlsArgs {
+    /// Path to PEM certificate file (required unless server TLS is disabled).
+    #[arg(
+        long = "server.tls.cert",
+        visible_alias = "tls-cert",
+        env = "OPENSHELL_TLS_CERT"
+    )]
+    cert: Option<PathBuf>,
+
+    /// Path to PEM private key file (required unless server TLS is disabled).
+    #[arg(long = "server.tls.key", visible_alias = "tls-key", env = "OPENSHELL_TLS_KEY")]
+    key: Option<PathBuf>,
+
+    /// Path to PEM CA certificate for mTLS client verification.
+    #[arg(
+        long = "server.tls.client-ca",
+        visible_alias = "tls-client-ca",
+        env = "OPENSHELL_TLS_CLIENT_CA"
+    )]
+    client_ca: Option<PathBuf>,
+
+    /// Listen on plaintext HTTP — no gateway TLS (e.g. behind a reverse proxy or tunnel).
+    #[arg(
+        long = "server.tls.disable",
+        visible_alias = "disable-tls",
+        env = "OPENSHELL_DISABLE_TLS",
+        default_value_t = false,
+        action = ArgAction::SetTrue
+    )]
+    disable: bool,
+
+    /// Accept TLS connections without a client certificate (application-layer auth only).
+    #[arg(
+        long = "server.tls.disable-gateway-auth",
+        visible_alias = "disable-gateway-auth",
+        env = "OPENSHELL_DISABLE_GATEWAY_AUTH",
+        default_value_t = false,
+        action = ArgAction::SetTrue
+    )]
+    disable_gateway_auth: bool,
+}
+
+/// Main listener: TCP port (`0.0.0.0:<port>`) and gateway TLS.
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Server")]
+struct ServerArgs {
+    /// TCP listen port (all interfaces).
+    #[arg(
+        long = "server.port",
+        visible_alias = "port",
+        default_value_t = openshell_core::DEFAULT_SERVER_PORT,
+        env = "OPENSHELL_SERVER_PORT"
+    )]
+    port: u16,
+
+    #[command(flatten)]
+    tls: ServerTlsArgs,
+}
+
+/// Health listener options (plaintext HTTP for `/health`, `/healthz`, `/readyz`).
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Health")]
+struct HealthArgs {
+    /// Plaintext port (all interfaces). Binds `0.0.0.0:<port>`.
+    #[arg(
+        long = "health.port",
+        visible_alias = "health-http-port",
+        default_value_t = openshell_core::DEFAULT_HEALTH_SERVER_PORT,
+        env = "OPENSHELL_HEALTH_HTTP_PORT"
+    )]
+    port: u16,
+}
+
 /// `OpenShell` gateway process - gRPC and HTTP server with protocol multiplexing.
 #[derive(Parser, Debug)]
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
-struct Args {
-    /// Port to bind the server to (all interfaces).
-    #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
-    port: u16,
+struct GatewayArgs {
+    #[command(flatten)]
+    server: ServerArgs,
+
+    #[command(flatten)]
+    health: HealthArgs,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
-
-    /// Path to TLS certificate file (required unless --disable-tls).
-    #[arg(long, env = "OPENSHELL_TLS_CERT")]
-    tls_cert: Option<PathBuf>,
-
-    /// Path to TLS private key file (required unless --disable-tls).
-    #[arg(long, env = "OPENSHELL_TLS_KEY")]
-    tls_key: Option<PathBuf>,
-
-    /// Path to CA certificate for client certificate verification (mTLS).
-    #[arg(long, env = "OPENSHELL_TLS_CLIENT_CA")]
-    tls_client_ca: Option<PathBuf>,
 
     /// Database URL for persistence.
     #[arg(long, env = "OPENSHELL_DB_URL", required = true)]
@@ -80,7 +146,11 @@ struct Args {
     ssh_gateway_host: String,
 
     /// Public port for the SSH gateway.
-    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = 8080)]
+    #[arg(
+        long,
+        env = "OPENSHELL_SSH_GATEWAY_PORT",
+        default_value_t = openshell_core::DEFAULT_SERVER_PORT
+    )]
     ssh_gateway_port: u16,
 
     /// HTTP path for SSH CONNECT/upgrade.
@@ -165,21 +235,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_VM_TLS_KEY")]
     vm_tls_key: Option<PathBuf>,
 
-    /// Disable TLS entirely — listen on plaintext HTTP.
-    /// Use this when the gateway sits behind a reverse proxy or tunnel
-    /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
-    #[arg(long, env = "OPENSHELL_DISABLE_TLS")]
-    disable_tls: bool,
-
-    /// Disable gateway authentication (mTLS client certificate requirement).
-    /// When set, the TLS handshake accepts connections without a client
-    /// certificate. Ignored when --disable-tls is set.
-    #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
-    disable_gateway_auth: bool,
 }
 
 pub fn command() -> Command {
-    Args::command()
+    GatewayArgs::command()
         .name("openshell-gateway")
         .bin_name("openshell-gateway")
 }
@@ -189,45 +248,50 @@ pub async fn run_cli() -> Result<()> {
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 
-    let args = Args::from_arg_matches(&command().get_matches()).expect("clap validated args");
+    let args = GatewayArgs::from_arg_matches(&command().get_matches()).expect("clap validated args");
 
     run_from_args(args).await
 }
 
-async fn run_from_args(args: Args) -> Result<()> {
+async fn run_from_args(args: GatewayArgs) -> Result<()> {
     let tracing_log_bus = TracingLogBus::new();
     tracing_log_bus.install_subscriber(
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
     );
 
-    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let bind = SocketAddr::from(([0, 0, 0, 0], args.server.port));
 
-    let tls = if args.disable_tls {
+    let tls = if args.server.tls.disable {
         None
     } else {
-        let cert_path = args.tls_cert.ok_or_else(|| {
+        let cert_path = args.server.tls.cert.ok_or_else(|| {
             miette::miette!(
-                "--tls-cert is required when TLS is enabled (use --disable-tls to skip)"
+                "--server.tls.cert is required when TLS is enabled (use --server.tls.disable / --disable-tls for plaintext)"
             )
         })?;
-        let key_path = args.tls_key.ok_or_else(|| {
-            miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
-        })?;
-        let client_ca_path = args.tls_client_ca.ok_or_else(|| {
+        let key_path = args.server.tls.key.ok_or_else(|| {
             miette::miette!(
-                "--tls-client-ca is required when TLS is enabled (use --disable-tls to skip)"
+                "--server.tls.key is required when TLS is enabled (use --server.tls.disable / --disable-tls for plaintext)"
+            )
+        })?;
+        let client_ca_path = args.server.tls.client_ca.ok_or_else(|| {
+            miette::miette!(
+                "--server.tls.client-ca is required when TLS is enabled (use --server.tls.disable / --disable-tls for plaintext)"
             )
         })?;
         Some(openshell_core::TlsConfig {
             cert_path,
             key_path,
             client_ca_path,
-            allow_unauthenticated: args.disable_gateway_auth,
+            allow_unauthenticated: args.server.tls.disable_gateway_auth,
         })
     };
 
+    let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health.port));
+
     let mut config = openshell_core::Config::new(tls)
         .with_bind_address(bind)
+        .with_health_bind_address(health_bind)
         .with_log_level(&args.log_level);
 
     config = config
@@ -275,11 +339,13 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_key: args.vm_tls_key,
     };
 
-    if args.disable_tls {
+    if args.server.tls.disable {
         info!("TLS disabled — listening on plaintext HTTP");
-    } else if args.disable_gateway_auth {
+    } else if args.server.tls.disable_gateway_auth {
         info!("Gateway auth disabled — accepting connections without client certificates");
     }
+
+    info!(address = %config.health_bind_address, "Health HTTP listener");
 
     info!(bind = %config.bind_address, "Starting OpenShell server");
 

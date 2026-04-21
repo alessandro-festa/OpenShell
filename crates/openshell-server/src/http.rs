@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! HTTP health endpoints using Axum.
+//! HTTP routing (health port and main listener).
 
 use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
 use serde::Serialize;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 
 /// Health check response.
 #[derive(Debug, Serialize)]
@@ -45,9 +46,15 @@ pub fn health_router() -> Router {
         .route("/readyz", get(readyz))
 }
 
-/// Create the HTTP router.
+/// Plaintext HTTP for [`health_router`].
+pub async fn serve_health_listener(listener: TcpListener) -> std::io::Result<()> {
+    let app = health_router();
+    axum::serve(listener, app).await
+}
+
+/// SSH CONNECT, WebSocket tunnel, and browser auth for the main listener.
 pub fn http_router(state: Arc<crate::ServerState>) -> Router {
-    health_router()
+    Router::new()
         .merge(crate::ssh_tunnel::router(state.clone()))
         .merge(crate::ws_tunnel::router(state.clone()))
         .merge(crate::auth::router(state))

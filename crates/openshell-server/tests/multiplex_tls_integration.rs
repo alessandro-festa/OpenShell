@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use axum::http::StatusCode as AxumStatusCode;
+use axum::{Router, routing::get};
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
@@ -23,7 +25,7 @@ use openshell_core::proto::{
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use openshell_server::{MultiplexedService, TlsAcceptor, health_router};
+use openshell_server::{MultiplexedService, TlsAcceptor};
 use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -367,7 +369,8 @@ async fn start_test_server(
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service =
+        Router::new().route("/__mux_http_probe", get(|| async { AxumStatusCode::OK }));
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let handle = tokio::spawn(async move {
@@ -488,7 +491,10 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
     let client = https_client_mtls(&pki);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("https://localhost:{}/healthz", addr.port()))
+        .uri(format!(
+            "https://localhost:{}/__mux_http_probe",
+            addr.port()
+        ))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.unwrap();

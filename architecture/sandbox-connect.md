@@ -60,7 +60,7 @@ An Axum route at `/connect/ssh` on the shared gateway port. Handles HTTP CONNECT
 
 **File**: `crates/openshell-server/src/multiplex.rs`
 
-The gateway runs a single listener that multiplexes gRPC and HTTP on the same port. `MultiplexedService` routes based on the `content-type` header: requests with `application/grpc` go to the gRPC router; all others (including HTTP CONNECT) go to the HTTP router. The HTTP router (`crates/openshell-server/src/http.rs`) merges health endpoints with the SSH tunnel router.
+The gateway runs a single listener that multiplexes gRPC and HTTP on the same port. `MultiplexedService` routes based on the `content-type` header: requests with `application/grpc` go to the gRPC router; all others (including HTTP CONNECT) go to the HTTP router (`http_router` in `crates/openshell-server/src/http.rs`: SSH tunnel, WebSocket tunnel, browser auth). `/health*` is served on a separate plaintext port.
 
 ### Sandbox SSH daemon
 

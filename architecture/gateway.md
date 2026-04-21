@@ -2,7 +2,7 @@
 
 ## Overview
 
-`openshell-server` is the gateway -- the central control plane for a cluster. It exposes two gRPC services (OpenShell and Inference) and HTTP endpoints on a single multiplexed port, manages sandbox lifecycle through Kubernetes CRDs, persists state in SQLite or Postgres, and provides SSH tunneling into sandbox pods. The gateway coordinates all interactions between clients, the Kubernetes cluster, and the persistence layer.
+`openshell-server` is the gateway -- the central control plane for a cluster. It exposes two gRPC services (OpenShell and Inference) plus HTTP on one port (SSH CONNECT, WebSocket tunnel, browser auth), serves `/health`, `/healthz`, and `/readyz` on a **separate plaintext port** (default 8081), manages sandbox lifecycle through Kubernetes CRDs, persists state in SQLite or Postgres, and provides SSH tunneling into sandbox pods. The gateway coordinates all interactions between clients, the Kubernetes cluster, and the persistence layer.
 
 ## Architecture Diagram
 
@@ -17,8 +17,7 @@ graph TD
     GRPC_ROUTER["GrpcRouter"]
     NAV["OpenShellServer<br/>(OpenShell service)"]
     INF["InferenceServer<br/>(Inference service)"]
-    HTTP["HTTP Router<br/>(Axum)"]
-    HEALTH["Health Endpoints"]
+    HTTP["HTTP Router<br/>(Axum: SSH / WS / auth)"]
     SSH_TUNNEL["SSH Tunnel<br/>(/connect/ssh)"]
     STORE["Store<br/>(SQLite / Postgres)"]
     K8S["Kubernetes API"]
@@ -36,7 +35,6 @@ graph TD
     MUX -->|"other"| HTTP
     GRPC_ROUTER -->|"/openshell.inference.v1.Inference/*"| INF
     GRPC_ROUTER -->|"all other paths"| NAV
-    HTTP --> HEALTH
     HTTP --> SSH_TUNNEL
     NAV --> STORE
     NAV --> K8S
@@ -62,7 +60,7 @@ graph TD
 | Protocol mux | `crates/openshell-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
 | gRPC: OpenShell | `crates/openshell-server/src/grpc.rs` | `OpenShellService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
 | gRPC: Inference | `crates/openshell-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
-| HTTP | `crates/openshell-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
+| HTTP | `crates/openshell-server/src/http.rs` | `health_router` on plaintext `health_bind_address`; `http_router` (SSH, WS, auth) on the main listener |
 | Browser auth | `crates/openshell-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
 | SSH tunnel | `crates/openshell-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
 | WS tunnel | `crates/openshell-server/src/ws_tunnel.rs` | WebSocket tunnel handler at `/_ws_tunnel` for Cloudflare-fronted clients |
@@ -105,8 +103,9 @@ The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and procee
       - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, republishes platform events, and runs a periodic `ListSandboxes` snapshot reconcile so the store-backed public sandbox reads stay aligned with the compute driver.
    5. Create `MultiplexService`.
    6. Bind `TcpListener` on `config.bind_address`.
-   7. Optionally create `TlsAcceptor` from cert/key files.
-   8. Enter the accept loop: for each connection, spawn a tokio task that optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
+   7. Bind a second listener on `config.health_bind_address` and spawn `http::serve_health_listener` (`health_router`, plaintext only).
+   8. Optionally create `TlsAcceptor` from cert/key files for the main listener.
+   9. Enter the accept loop: for each connection, spawn a tokio task that optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
 
 ## Configuration
 
@@ -114,13 +113,14 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
+| `--server.port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`; `--port` alias) |
+| `--health.port` | `OPENSHELL_HEALTH_HTTP_PORT` | `8081` | Plaintext port for `/health`, `/healthz`, `/readyz` only (`--health-http-port` is an alias). |
 | `--log-level` | `OPENSHELL_LOG_LEVEL` | `info` | Tracing log level filter |
-| `--tls-cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file |
-| `--tls-key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file |
-| `--tls-client-ca` | `OPENSHELL_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification |
-| `--disable-tls` | `OPENSHELL_DISABLE_TLS` | `false` | Listen on plaintext HTTP behind a trusted reverse proxy or tunnel |
-| `--disable-gateway-auth` | `OPENSHELL_DISABLE_GATEWAY_AUTH` | `false` | Keep TLS enabled but allow no-certificate clients and rely on application-layer auth |
+| `--server.tls.cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file (`--tls-cert` alias) |
+| `--server.tls.key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file (`--tls-key` alias) |
+| `--server.tls.client-ca` | `OPENSHELL_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification (`--tls-client-ca` alias) |
+| `--server.tls.disable` | `OPENSHELL_DISABLE_TLS` | `false` | Listen on plaintext HTTP (`--disable-tls` alias) |
+| `--server.tls.disable-gateway-auth` | `OPENSHELL_DISABLE_GATEWAY_AUTH` | `false` | Keep TLS enabled but allow no-certificate clients (`--disable-gateway-auth` alias) |
 | `--client-tls-secret-name` | `OPENSHELL_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
 | `--db-url` | `OPENSHELL_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/openshell/openshell.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
@@ -197,8 +197,8 @@ Both gRPC and HTTP handlers produce different response body types. `MultiplexedS
 When TLS is enabled (`crates/openshell-server/src/tls.rs`):
 
 - `TlsAcceptor::from_files()` loads PEM certificates and keys via `rustls_pemfile`, builds a `rustls::ServerConfig`, and configures ALPN to advertise `h2` and `http/1.1`.
-- When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` by default. In Cloudflare-fronted deployments, `--disable-gateway-auth` keeps TLS enabled but allows no-certificate clients so the edge can forward a JWT instead.
-- `--disable-tls` removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
+- When a client CA path is provided (`--server.tls.client-ca`, alias `--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` by default. In Cloudflare-fronted deployments, `--server.tls.disable-gateway-auth` (alias `--disable-gateway-auth`) keeps TLS enabled but allows no-certificate clients so the edge can forward a JWT instead.
+- `--server.tls.disable` (alias `--disable-tls`) removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
 - Supports PKCS#1, PKCS#8, and SEC1 private key formats.
 - The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
 - Certificates are generated at cluster bootstrap time by the `openshell-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `openshell-server-tls` (server cert+key), `openshell-server-client-ca` (CA cert), and `openshell-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).

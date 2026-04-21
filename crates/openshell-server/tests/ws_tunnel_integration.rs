@@ -26,6 +26,7 @@
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::Message},
+    http::StatusCode as AxumStatusCode,
     response::IntoResponse,
     routing::get,
 };
@@ -50,7 +51,7 @@ use openshell_core::proto::{
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use openshell_server::{MultiplexedService, health_router};
+use openshell_server::MultiplexedService;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -543,7 +544,8 @@ async fn start_grpc_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service =
+        Router::new().route("/__mux_http_probe", get(|| async { AxumStatusCode::OK }));
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let handle = tokio::spawn(async move {
@@ -571,7 +573,8 @@ async fn start_ws_tunnel_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service =
+        Router::new().route("/__mux_http_probe", get(|| async { AxumStatusCode::OK }));
     let app = test_ws_tunnel_router(MultiplexedService::new(grpc_service, http_service));
 
     let handle = tokio::spawn(async move {
@@ -660,8 +663,7 @@ async fn ws_tunnel_grpc_health_through_websocket() {
         "gRPC health check through WS tunnel should return Healthy"
     );
 
-    // Also verify HTTP /healthz works directly (not through tunnel — WS is
-    // for gRPC; HTTP healthz goes through the multiplexed service directly).
+    // Plain HTTP GET on the gRPC server (tunnel is gRPC-only).
     let stream = TcpStream::connect(stack.grpc_addr).await.unwrap();
     let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(stream))
@@ -672,7 +674,7 @@ async fn ws_tunnel_grpc_health_through_websocket() {
     });
     let req = Request::builder()
         .method("GET")
-        .uri(format!("http://{}/healthz", stack.grpc_addr))
+        .uri(format!("http://{}/__mux_http_probe", stack.grpc_addr))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = sender.send_request(req).await.unwrap();

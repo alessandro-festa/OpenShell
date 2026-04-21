@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use axum::http::StatusCode as AxumStatusCode;
+use axum::{Router, routing::get};
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
@@ -21,7 +23,7 @@ use openshell_core::proto::{
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use openshell_server::{MultiplexedService, health_router};
+use openshell_server::MultiplexedService;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -283,7 +285,8 @@ async fn serves_grpc_and_http_on_same_port() {
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service =
+        Router::new().route("/__mux_http_probe", get(|| async { AxumStatusCode::OK }));
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let server = tokio::spawn(async move {
@@ -317,7 +320,7 @@ async fn serves_grpc_and_http_on_same_port() {
 
     let req = Request::builder()
         .method("GET")
-        .uri(format!("http://{addr}/healthz"))
+        .uri(format!("http://{addr}/__mux_http_probe"))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = sender.send_request(req).await.unwrap();

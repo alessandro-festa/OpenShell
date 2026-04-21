@@ -25,6 +25,8 @@
 //!      implemented) would reject.  This test proves the TLS layer alone does
 //!      not block unauthenticated connections when the flag is set.
 
+use axum::http::StatusCode as AxumStatusCode;
+use axum::{Router, routing::get};
 use bytes::Bytes;
 use http_body_util::Empty;
 use hyper::{Request, StatusCode};
@@ -47,7 +49,7 @@ use openshell_core::proto::{
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
-use openshell_server::{MultiplexedService, TlsAcceptor, health_router};
+use openshell_server::{MultiplexedService, TlsAcceptor};
 use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
@@ -387,7 +389,8 @@ async fn start_test_server(
     let addr = listener.local_addr().unwrap();
 
     let grpc_service = OpenShellServer::new(TestOpenShell);
-    let http_service = health_router();
+    let http_service =
+        Router::new().route("/__mux_http_probe", get(|| async { AxumStatusCode::OK }));
     let service = MultiplexedService::new(grpc_service, http_service);
 
     let handle = tokio::spawn(async move {
@@ -586,7 +589,10 @@ async fn baseline_mtls_works_with_mandatory_client_certs() {
     let client = https_client_mtls(&pki);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("https://localhost:{}/healthz", addr.port()))
+        .uri(format!(
+            "https://localhost:{}/__mux_http_probe",
+            addr.port()
+        ))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.unwrap();
@@ -666,7 +672,10 @@ async fn dual_auth_mtls_still_accepted() {
     let client = https_client_mtls(&pki);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("https://localhost:{}/healthz", addr.port()))
+        .uri(format!(
+            "https://localhost:{}/__mux_http_probe",
+            addr.port()
+        ))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.unwrap();
@@ -709,7 +718,10 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
     let client = https_client_no_cert(&pki.ca_cert_pem);
     let req = Request::builder()
         .method("GET")
-        .uri(format!("https://localhost:{}/healthz", addr.port()))
+        .uri(format!(
+            "https://localhost:{}/__mux_http_probe",
+            addr.port()
+        ))
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.unwrap();
