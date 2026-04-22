@@ -52,3 +52,8 @@ run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2
 description = "Boot openshell-vm and run smoke e2e (macOS ARM64; pass -- --vm-port=N [--vm-name=NAME] to reuse)"
 depends = ["build:docker:gateway", "vm:build"]
 run = "e2e/rust/e2e-vm.sh"
+
+["e2e:docker"]
+description = "Run smoke e2e against a standalone gateway with the Docker compute driver"
+depends = ["build:docker:supervisor"]
+run = "e2e/rust/e2e-docker.sh"
