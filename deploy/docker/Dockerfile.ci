@@ -70,12 +70,13 @@ RUN curl https://mise.run | MISE_VERSION=$MISE_VERSION sh
 
 # Copy mise.toml and task includes, then install all tools via mise
 COPY mise.toml /opt/mise/mise.toml
+COPY mise.lock /opt/mise/mise.lock
 COPY tasks/ /opt/mise/tasks/
 WORKDIR /opt/mise
 RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
     export MISE_GITHUB_TOKEN="$(cat /run/secrets/MISE_GITHUB_TOKEN 2>/dev/null || true)" && \
     mise trust /opt/mise/mise.toml && \
-    env -u RUSTC_WRAPPER mise install && \
+    env -u RUSTC_WRAPPER mise install --locked && \
     mise reshim && \
     (/root/.cargo/bin/rustup component remove rust-docs || true) && \
     rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man
