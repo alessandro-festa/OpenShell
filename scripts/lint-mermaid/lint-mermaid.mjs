@@ -2,6 +2,27 @@
 // Validate ```mermaid fenced blocks in Markdown/MDX files using the official
 // mermaid parser. Line numbers in error output are offset back to the source
 // file so editors can jump to them.
+//
+// Why this approach (load the real `mermaid` npm package in Node + jsdom):
+//
+// - `@mermaid-js/mermaid-cli` (mmdc): uses the official parser/renderer, but
+//   pulls Puppeteer + Chromium (~300MB) because it also produces SVGs. Way
+//   too heavy for pre-commit; usable only as a CI backstop.
+// - `@probelabs/maid`: fast, Chevrotain-based, single small package. In
+//   practice it produced false positives AND missed real errors in this
+//   repo (notably the `exec()s` sequence-diagram bug in
+//   `architecture/sandbox-connect.md`). Dropped for unreliability.
+// - `go-mermaid`: pure Go single binary — attractive, but a custom parser
+//   that lags the official Mermaid grammar; would drift silently.
+// - `@mermaid-js/parser` (Langium, official): library only, and as of
+//   writing covers only a subset of diagram types (flowchart, sequence,
+//   class, state still partially on the legacy Jison grammar inside the
+//   main `mermaid` package). Incomplete for our mix of diagrams.
+// - `mermaid.parse()` from the `mermaid` package (this approach): uses the
+//   SAME grammar that actually renders on GitHub and in Fern previews, so
+//   "passes here" == "renders there". Needs a DOM shim because mermaid
+//   loads DOMPurify at import time, hence jsdom. Runs in ~2s across the
+//   repo with no browser dependency.
 
 import { readdir, readFile } from 'node:fs/promises';
 import { join, relative, resolve, extname } from 'node:path';
