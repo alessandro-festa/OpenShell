@@ -27,7 +27,16 @@ jobs:
       - name: Mark workspace as safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      - name: Detect mise config changes
+        id: changed
+        uses: tj-actions/changed-files@aa08304bd477b800d468db44fe10f6c61f7f7b11 # v42.1.0
+        with:
+          files: |
+            mise.toml
+            mise.lock
+
       - name: Verify mise.lock is in sync with mise.toml
+        if: steps.changed.outputs.any_changed == 'true'
         run: |
           mise lock
           if ! git diff --exit-code mise.lock; then
