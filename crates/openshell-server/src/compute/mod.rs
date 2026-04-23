@@ -11,6 +11,7 @@ use crate::grpc::policy::{SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_settings_id};
 use crate::persistence::{ObjectId, ObjectName, ObjectRecord, ObjectType, Store};
 use crate::sandbox_index::SandboxIndex;
 use crate::sandbox_watch::SandboxWatchBus;
+use crate::supervisor_session::SupervisorSessionRegistry;
 use crate::tracing_bus::TracingLogBus;
 use futures::{Stream, StreamExt};
 use openshell_core::proto::compute::v1::{
@@ -185,6 +186,7 @@ pub struct ComputeRuntime {
     sandbox_index: SandboxIndex,
     sandbox_watch_bus: SandboxWatchBus,
     tracing_log_bus: TracingLogBus,
+    supervisor_sessions: Arc<SupervisorSessionRegistry>,
     sync_lock: Arc<Mutex<()>>,
     /// Whether the compute driver legitimately produces loopback endpoints
     /// (e.g. `127.0.0.1`) for sandbox SSH targets.  When `true`, the SSRF
@@ -211,6 +213,7 @@ impl ComputeRuntime {
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
         allows_loopback_endpoints: bool,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let default_image = driver
             .get_capabilities(Request::new(GetCapabilitiesRequest {}))
@@ -226,6 +229,7 @@ impl ComputeRuntime {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            supervisor_sessions,
             sync_lock: Arc::new(Mutex::new(())),
             allows_loopback_endpoints,
         })
@@ -237,6 +241,7 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver = KubernetesComputeDriver::new(config)
             .await
@@ -250,6 +255,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             false,
+            supervisor_sessions,
         )
         .await
     }
@@ -261,6 +267,7 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver: SharedComputeDriver = Arc::new(RemoteComputeDriver::new(channel));
         // The VM driver resolves sandbox SSH endpoints to 127.0.0.1
@@ -274,6 +281,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             true,
+            supervisor_sessions,
         )
         .await
     }
@@ -284,6 +292,7 @@ impl ComputeRuntime {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
+        supervisor_sessions: Arc<SupervisorSessionRegistry>,
     ) -> Result<Self, ComputeError> {
         let driver = PodmanComputeDriver::new(config)
             .await
@@ -297,6 +306,7 @@ impl ComputeRuntime {
             sandbox_watch_bus,
             tracing_log_bus,
             true,
+            supervisor_sessions,
         )
         .await
     }
@@ -605,7 +615,8 @@ impl ComputeRuntime {
             existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
         );
 
-        let phase = derive_phase(incoming.status.as_ref());
+        let session_connected = self.supervisor_sessions.has_session(&incoming.id);
+        let mut phase = derive_phase(incoming.status.as_ref());
         let mut sandbox = existing.unwrap_or_else(|| Sandbox {
             id: incoming.id.clone(),
             name: incoming.name.clone(),
@@ -615,6 +626,12 @@ impl ComputeRuntime {
             phase: SandboxPhase::Unknown as i32,
             ..Default::default()
         });
+
+        if session_connected && matches!(phase, SandboxPhase::Provisioning | SandboxPhase::Unknown)
+        {
+            ensure_supervisor_ready_status(&mut status, &sandbox.name);
+            phase = SandboxPhase::Ready;
+        }
 
         let old_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
         if old_phase != phase {
@@ -661,6 +678,55 @@ impl ComputeRuntime {
             .await
             .map_err(|e| e.to_string())?;
         self.sandbox_watch_bus.notify(&sandbox.id);
+        Ok(())
+    }
+
+    pub async fn supervisor_session_connected(&self, sandbox_id: &str) -> Result<(), String> {
+        self.set_supervisor_session_state(sandbox_id, true).await
+    }
+
+    pub async fn supervisor_session_disconnected(&self, sandbox_id: &str) -> Result<(), String> {
+        self.set_supervisor_session_state(sandbox_id, false).await
+    }
+
+    async fn set_supervisor_session_state(
+        &self,
+        sandbox_id: &str,
+        connected: bool,
+    ) -> Result<(), String> {
+        let _guard = self.sync_lock.lock().await;
+        let Some(record) = self
+            .store
+            .get(Sandbox::object_type(), sandbox_id)
+            .await
+            .map_err(|e| e.to_string())?
+        else {
+            return Ok(());
+        };
+
+        let mut sandbox = decode_sandbox_record(&record)?;
+        let current_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
+
+        if current_phase == SandboxPhase::Deleting || current_phase == SandboxPhase::Error {
+            return Ok(());
+        }
+
+        if connected {
+            ensure_supervisor_ready_status(&mut sandbox.status, &sandbox.name);
+            sandbox.phase = SandboxPhase::Ready as i32;
+        } else if current_phase == SandboxPhase::Ready {
+            ensure_supervisor_not_ready_status(&mut sandbox.status, &sandbox.name);
+            sandbox.phase = SandboxPhase::Provisioning as i32;
+        } else {
+            return Ok(());
+        }
+
+        self.sandbox_index.update_from_sandbox(&sandbox);
+        self.store
+            .put_message(&sandbox)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.sandbox_watch_bus.notify(sandbox_id);
         Ok(())
     }
 
@@ -1005,6 +1071,58 @@ fn public_status_from_driver(status: &DriverSandboxStatus) -> SandboxStatus {
     }
 }
 
+fn ensure_supervisor_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
+    upsert_ready_condition(
+        status,
+        sandbox_name,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "True".to_string(),
+            reason: "DependenciesReady".to_string(),
+            message: "Supervisor session connected".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
+}
+
+fn ensure_supervisor_not_ready_status(status: &mut Option<SandboxStatus>, sandbox_name: &str) {
+    upsert_ready_condition(
+        status,
+        sandbox_name,
+        SandboxCondition {
+            r#type: "Ready".to_string(),
+            status: "False".to_string(),
+            reason: "DependenciesNotReady".to_string(),
+            message: "Supervisor session disconnected".to_string(),
+            last_transition_time: String::new(),
+        },
+    );
+}
+
+fn upsert_ready_condition(
+    status: &mut Option<SandboxStatus>,
+    sandbox_name: &str,
+    condition: SandboxCondition,
+) {
+    let status = status.get_or_insert_with(|| SandboxStatus {
+        sandbox_name: sandbox_name.to_string(),
+        agent_pod: String::new(),
+        agent_fd: String::new(),
+        sandbox_fd: String::new(),
+        conditions: Vec::new(),
+    });
+
+    if let Some(existing) = status
+        .conditions
+        .iter_mut()
+        .find(|existing| existing.r#type == "Ready")
+    {
+        *existing = condition;
+    } else {
+        status.conditions.push(condition);
+    }
+}
+
 fn public_condition_from_driver(condition: &DriverCondition) -> SandboxCondition {
     SandboxCondition {
         r#type: condition.r#type.clone(),
@@ -1093,6 +1211,7 @@ mod tests {
         GetSandboxResponse, StopSandboxRequest, StopSandboxResponse, ValidateSandboxCreateResponse,
     };
     use std::sync::Arc;
+    use tokio::sync::{mpsc, oneshot};
 
     #[derive(Debug, Default)]
     struct TestDriver {
@@ -1208,9 +1327,21 @@ mod tests {
             sandbox_index: SandboxIndex::new(),
             sandbox_watch_bus: SandboxWatchBus::new(),
             tracing_log_bus: TracingLogBus::new(),
+            supervisor_sessions: Arc::new(SupervisorSessionRegistry::new()),
             sync_lock: Arc::new(Mutex::new(())),
             allows_loopback_endpoints: false,
         }
+    }
+
+    fn register_test_supervisor_session(runtime: &ComputeRuntime, sandbox_id: &str) {
+        let (tx, _rx) = mpsc::channel(1);
+        let (shutdown_tx, _shutdown_rx) = oneshot::channel();
+        runtime.supervisor_sessions.register(
+            sandbox_id.to_string(),
+            "session-1".to_string(),
+            tx,
+            shutdown_tx,
+        );
     }
 
     fn sandbox_record(id: &str, name: &str, phase: SandboxPhase) -> Sandbox {
@@ -1465,6 +1596,122 @@ mod tests {
             SandboxPhase::try_from(stored.phase).unwrap(),
             SandboxPhase::Ready
         );
+    }
+
+    #[tokio::test]
+    async fn apply_sandbox_update_promotes_connected_supervisor_session_to_ready() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        register_test_supervisor_session(&runtime, "sb-1");
+
+        runtime
+            .apply_sandbox_update(DriverSandbox {
+                id: "sb-1".to_string(),
+                name: "sandbox-a".to_string(),
+                namespace: "default".to_string(),
+                spec: None,
+                status: Some(make_driver_status(make_driver_condition(
+                    "Starting",
+                    "VM is starting",
+                ))),
+            })
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Ready
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "True");
+        assert_eq!(ready.reason, "DependenciesReady");
+        assert_eq!(ready.message, "Supervisor session connected");
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_connected_promotes_store_state_without_driver_refresh() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Provisioning);
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime.supervisor_session_connected("sb-1").await.unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_session_disconnected_demotes_ready_sandbox() {
+        let runtime = test_runtime(Arc::new(TestDriver::default())).await;
+        let mut sandbox = sandbox_record("sb-1", "sandbox-a", SandboxPhase::Ready);
+        sandbox.status = Some(SandboxStatus {
+            sandbox_name: "sandbox-a".to_string(),
+            agent_pod: String::new(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "True".to_string(),
+                reason: "DependenciesReady".to_string(),
+                message: "Supervisor session connected".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+        runtime.store.put_message(&sandbox).await.unwrap();
+
+        runtime
+            .supervisor_session_disconnected("sb-1")
+            .await
+            .unwrap();
+
+        let stored = runtime
+            .store
+            .get_message::<Sandbox>("sb-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            SandboxPhase::try_from(stored.phase).unwrap(),
+            SandboxPhase::Provisioning
+        );
+        let ready = stored
+            .status
+            .as_ref()
+            .and_then(|status| {
+                status
+                    .conditions
+                    .iter()
+                    .find(|condition| condition.r#type == "Ready")
+            })
+            .unwrap();
+        assert_eq!(ready.status, "False");
+        assert_eq!(ready.reason, "DependenciesNotReady");
+        assert_eq!(ready.message, "Supervisor session disconnected");
     }
 
     #[tokio::test]

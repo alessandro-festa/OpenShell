@@ -54,6 +54,5 @@ depends = ["build:docker:supervisor-sideload"]
 run = "e2e/rust/e2e-podman.sh"
 
 ["e2e:vm"]
-description = "Boot openshell-vm and run smoke e2e (macOS ARM64; pass -- --vm-port=N [--vm-name=NAME] to reuse)"
-depends = ["build:docker:gateway", "vm:build"]
+description = "Start openshell-gateway with the VM compute driver and run the cluster-agnostic smoke e2e"
 run = "e2e/rust/e2e-vm.sh"

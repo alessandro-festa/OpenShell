@@ -33,6 +33,8 @@ const DRIVER_NAME: &str = "openshell-driver-vm";
 const WATCH_BUFFER: usize = 256;
 const DEFAULT_VCPUS: u8 = 2;
 const DEFAULT_MEM_MIB: u32 = 2048;
+const GVPROXY_GATEWAY_IP: &str = "192.168.127.1";
+const OPENSHELL_HOST_GATEWAY_ALIAS: &str = "host.openshell.internal";
 const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 const GUEST_TLS_DIR: &str = "/opt/openshell/tls";
 const GUEST_TLS_CA_PATH: &str = "/opt/openshell/tls/ca.crt";
@@ -147,7 +149,7 @@ fn validate_openshell_endpoint(endpoint: &str) -> Result<(), String> {
 
     if invalid_from_vm {
         return Err(format!(
-            "openshell endpoint '{endpoint}' is not reachable from sandbox VMs; use a concrete host such as 127.0.0.1, host.containers.internal, or another routable address"
+            "openshell endpoint '{endpoint}' is not reachable from sandbox VMs; use a concrete host such as 127.0.0.1, {OPENSHELL_HOST_GATEWAY_ALIAS}, or another routable address"
         ));
     }
 
@@ -256,7 +258,19 @@ impl VmDriver {
 
         let console_output = state_dir.join("rootfs-console.log");
         let mut command = Command::new(&self.launcher_bin);
-        command.kill_on_drop(true);
+        // Intentionally DO NOT set kill_on_drop(true). On a signal-driven
+        // driver exit (SIGKILL, SIGTERM without a handler, panic),
+        // tokio's Drop is racy with the launcher's procguard-initiated
+        // cleanup: if kill_on_drop SIGKILLs the launcher first, its
+        // cleanup callback never gets to SIGTERM gvproxy, and gvproxy is
+        // reparented to init as an orphan. Instead the whole cleanup
+        // cascade runs via procguard:
+        //   driver exits → launcher's kqueue (macOS) or PR_SET_PDEATHSIG
+        //   (Linux) fires → launcher kills gvproxy + libkrun fork →
+        //   launcher exits → its own children die under pdeathsig.
+        // The explicit Drop path in VmProcess::terminate_vm_process still
+        // handles voluntary `delete_sandbox` teardown cleanly, where we
+        // do want SIGTERM + wait + SIGKILL semantics.
         command.stdin(Stdio::null());
         command.stdout(Stdio::inherit());
         command.stderr(Stdio::inherit());
@@ -403,16 +417,23 @@ impl VmDriver {
         snapshots
     }
 
+    /// Watch the launcher child process and surface errors as driver
+    /// conditions.
+    ///
+    /// The driver no longer owns the `Ready` transition — the gateway
+    /// promotes a sandbox to `Ready` the moment its supervisor session
+    /// lands (see `openshell-server/src/compute/mod.rs`). This loop only
+    /// handles the sad paths: the child process failing to start, exiting
+    /// abnormally, or becoming unpollable. Those still surface as driver
+    /// `Error` conditions so the gateway can reason about a dead VM.
     async fn monitor_sandbox(&self, sandbox_id: String) {
-        let mut ready_emitted = false;
-
         loop {
-            let (process, state_dir) = {
+            let process = {
                 let registry = self.registry.lock().await;
                 let Some(record) = registry.get(&sandbox_id) else {
                     return;
                 };
-                (record.process.clone(), record.state_dir.clone())
+                record.process.clone()
             };
 
             let exit_status = {
@@ -467,16 +488,6 @@ impl VmDriver {
                     platform_event("vm", "Warning", "ProcessExited", message),
                 );
                 return;
-            }
-
-            if !ready_emitted && guest_ssh_ready(&state_dir).await {
-                if let Some(snapshot) = self
-                    .set_snapshot_condition(&sandbox_id, ready_condition(), false)
-                    .await
-                {
-                    self.publish_snapshot(snapshot);
-                }
-                ready_emitted = true;
             }
 
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -726,7 +737,7 @@ fn guest_visible_openshell_endpoint(endpoint: &str) -> String {
         None => false,
     };
 
-    if should_rewrite && url.set_host(Some("192.168.127.1")).is_ok() {
+    if should_rewrite && url.set_host(Some(GVPROXY_GATEWAY_IP)).is_ok() {
         return url.to_string();
     }
 
@@ -843,16 +854,6 @@ async fn terminate_vm_process(child: &mut Child) -> Result<(), std::io::Error> {
     }
 }
 
-async fn guest_ssh_ready(state_dir: &Path) -> bool {
-    let console_log = state_dir.join("rootfs-console.log");
-    let Ok(contents) = tokio::fs::read_to_string(console_log).await else {
-        return false;
-    };
-
-    contents.contains("SSH server is ready to accept connections")
-        || contents.contains("SSH server listening")
-}
-
 fn sandbox_snapshot(sandbox: &Sandbox, condition: SandboxCondition, deleting: bool) -> Sandbox {
     Sandbox {
         id: sandbox.id.clone(),
@@ -891,16 +892,6 @@ fn provisioning_condition() -> SandboxCondition {
         status: "False".to_string(),
         reason: "Starting".to_string(),
         message: "VM is starting".to_string(),
-        last_transition_time: String::new(),
-    }
-}
-
-fn ready_condition() -> SandboxCondition {
-    SandboxCondition {
-        r#type: "Ready".to_string(),
-        status: "True".to_string(),
-        reason: "Listening".to_string(),
-        message: "Supervisor is listening for SSH connections".to_string(),
         last_transition_time: String::new(),
     }
 }
@@ -1030,7 +1021,9 @@ mod tests {
 
         let env = build_guest_environment(&sandbox, &config);
         assert!(env.contains(&"HOME=/root".to_string()));
-        assert!(env.contains(&"OPENSHELL_ENDPOINT=http://192.168.127.1:8080/".to_string()));
+        assert!(env.contains(&format!(
+            "OPENSHELL_ENDPOINT=http://{GVPROXY_GATEWAY_IP}:8080/"
+        )));
         assert!(env.contains(&"OPENSHELL_SANDBOX_ID=sandbox-123".to_string()));
         assert!(env.contains(&format!(
             "OPENSHELL_SSH_SOCKET_PATH={GUEST_SSH_SOCKET_PATH}"
@@ -1038,10 +1031,36 @@ mod tests {
     }
 
     #[test]
+    fn guest_visible_openshell_endpoint_rewrites_loopback_hosts_to_gvproxy_gateway() {
+        assert_eq!(
+            guest_visible_openshell_endpoint("http://127.0.0.1:8080"),
+            format!("http://{GVPROXY_GATEWAY_IP}:8080/")
+        );
+        assert_eq!(
+            guest_visible_openshell_endpoint("http://localhost:8080"),
+            format!("http://{GVPROXY_GATEWAY_IP}:8080/")
+        );
+        assert_eq!(
+            guest_visible_openshell_endpoint("https://[::1]:8443"),
+            format!("https://{GVPROXY_GATEWAY_IP}:8443/")
+        );
+    }
+
+    #[test]
     fn guest_visible_openshell_endpoint_preserves_non_loopback_hosts() {
+        assert_eq!(
+            guest_visible_openshell_endpoint(&format!(
+                "http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080"
+            )),
+            format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080")
+        );
         assert_eq!(
             guest_visible_openshell_endpoint("http://host.containers.internal:8080"),
             "http://host.containers.internal:8080"
+        );
+        assert_eq!(
+            guest_visible_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080")),
+            format!("http://{GVPROXY_GATEWAY_IP}:8080")
         );
         assert_eq!(
             guest_visible_openshell_endpoint("https://gateway.internal:8443"),
@@ -1157,9 +1176,9 @@ mod tests {
     fn validate_openshell_endpoint_accepts_host_gateway() {
         validate_openshell_endpoint("http://host.containers.internal:8080")
             .expect("guest-reachable host alias should be accepted");
-        validate_openshell_endpoint("http://192.168.127.1:8080")
+        validate_openshell_endpoint(&format!("http://{GVPROXY_GATEWAY_IP}:8080"))
             .expect("gateway IP should be accepted");
-        validate_openshell_endpoint("http://host.openshell.internal:8080")
+        validate_openshell_endpoint(&format!("http://{OPENSHELL_HOST_GATEWAY_ALIAS}:8080"))
             .expect("openshell host alias should be accepted");
         validate_openshell_endpoint("https://gateway.internal:8443")
             .expect("dns endpoint should be accepted");
@@ -1210,32 +1229,6 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(key_mode, 0o600);
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn guest_ssh_ready_detects_guest_console_marker() {
-        let base = unique_temp_dir();
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(
-            base.join("rootfs-console.log"),
-            "...\nINFO openshell_sandbox: SSH server is ready to accept connections\n",
-        )
-        .unwrap();
-
-        assert!(guest_ssh_ready(&base).await);
-
-        let _ = std::fs::remove_dir_all(base);
-    }
-
-    #[tokio::test]
-    async fn guest_ssh_ready_is_false_without_marker() {
-        let base = unique_temp_dir();
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("rootfs-console.log"), "sandbox booting\n").unwrap();
-
-        assert!(!guest_ssh_ready(&base).await);
 
         let _ = std::fs::remove_dir_all(base);
     }
