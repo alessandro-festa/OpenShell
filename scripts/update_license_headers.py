@@ -48,6 +48,8 @@ COMMENT_STYLES: dict[str, str] = {
 EXCLUDE_DIRS: set[str] = {
     "target",
     "e2e/rust/target",
+    "architecture/plans",
+    "scripts/lint-mermaid/node_modules",
     ".venv",
     ".git",
     ".cache",

@@ -24,7 +24,8 @@
 //   loads DOMPurify at import time, hence jsdom. Runs in ~2s across the
 //   repo with no browser dependency.
 
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import { spawnSync } from 'node:child_process';
 import { join, relative, resolve, extname } from 'node:path';
 import { JSDOM } from 'jsdom';
 
@@ -39,7 +40,7 @@ const EXCLUDE_DIRS = new Set([
   '_build', 'build', 'dist', '.fern-cache', '.agents',
 ]);
 const EXTENSIONS = new Set(['.md', '.mdx']);
-const FENCE_RE = /^([ \t]*)```mermaid[ \t]*$/;
+const OPEN_FENCE_RE = /^[ \t]*(`{3,}|~{3,})(.*)$/;
 
 async function* walk(root) {
   const entries = await readdir(root, { withFileTypes: true });
@@ -52,21 +53,71 @@ async function* walk(root) {
   }
 }
 
+function getGitRoot() {
+  const result = spawnSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  return result.stdout.trim();
+}
+
+function filterGitIgnored(files) {
+  const gitRoot = getGitRoot();
+  if (!gitRoot || files.length === 0) return files;
+
+  const pathsByRel = new Map();
+  for (const file of files) {
+    const rel = relative(gitRoot, file);
+    if (rel.startsWith('..') || rel === '' || rel.startsWith('/')) continue;
+    pathsByRel.set(rel, file);
+  }
+  if (pathsByRel.size === 0) return files;
+
+  const result = spawnSync('git', ['check-ignore', '--stdin'], {
+    cwd: gitRoot,
+    input: `${Array.from(pathsByRel.keys()).join('\n')}\n`,
+    encoding: 'utf8',
+  });
+  if (result.status !== 0 && result.status !== 1) return files;
+
+  const ignored = new Set(result.stdout.split('\n').filter(Boolean));
+  return files.filter(file => {
+    const rel = relative(gitRoot, file);
+    return !ignored.has(rel);
+  });
+}
+
+function parseFenceOpen(line) {
+  const match = line.match(OPEN_FENCE_RE);
+  if (!match) return null;
+
+  const marker = match[1][0];
+  const length = match[1].length;
+  const info = match[2].trim();
+  if (marker === '`' && info.includes('`')) return null;
+
+  const language = info.split(/\s+/)[0].toLowerCase();
+  return { marker, length, isMermaid: language === 'mermaid' };
+}
+
+function isFenceClose(line, fence) {
+  const trimmed = line.trim();
+  return trimmed.length >= fence.length && [...trimmed].every(ch => ch === fence.marker);
+}
+
 function extractBlocks(text) {
   const lines = text.split('\n');
   const blocks = [];
   let i = 0;
   while (i < lines.length) {
-    const m = lines[i].match(FENCE_RE);
-    if (!m) { i++; continue; }
+    const fence = parseFenceOpen(lines[i]);
+    if (!fence) { i++; continue; }
     const startLine = i + 1;
     const body = [];
     i++;
-    while (i < lines.length && !/^[ \t]*```[ \t]*$/.test(lines[i])) {
-      body.push(lines[i]);
+    while (i < lines.length && !isFenceClose(lines[i], fence)) {
+      if (fence.isMermaid) body.push(lines[i]);
       i++;
     }
-    blocks.push({ startLine, body: body.join('\n') });
+    if (fence.isMermaid) blocks.push({ startLine, body: body.join('\n') });
     i++;
   }
   return blocks;
@@ -102,8 +153,8 @@ async function main() {
   for (const root of roots) {
     const abs = resolve(root);
     try {
-      const stat = await import('node:fs').then(m => m.promises.stat(abs));
-      if (stat.isDirectory()) {
+      const entry = await stat(abs);
+      if (entry.isDirectory()) {
         for await (const f of walk(abs)) files.push(f);
       } else if (EXTENSIONS.has(extname(abs))) {
         files.push(abs);
@@ -114,16 +165,17 @@ async function main() {
     }
   }
 
-  const results = await Promise.all(files.map(lintFile));
+  const filteredFiles = filterGitIgnored(files);
+  const results = await Promise.all(filteredFiles.map(lintFile));
   const allErrors = results.flat();
   const filesWithBlocks = results.reduce((n, errs, i) => n + (errs.length > 0 ? 1 : 0), 0);
 
   if (allErrors.length > 0) {
     for (const e of allErrors) console.error(e);
-    console.error(`\n${allErrors.length} mermaid error(s) in ${filesWithBlocks} file(s); scanned ${files.length} file(s)`);
+    console.error(`\n${allErrors.length} mermaid error(s) in ${filesWithBlocks} file(s); scanned ${filteredFiles.length} file(s)`);
     process.exit(1);
   }
-  console.log(`mermaid: scanned ${files.length} file(s), all diagrams valid`);
+  console.log(`mermaid: scanned ${filteredFiles.length} file(s), all diagrams valid`);
 }
 
 main().catch(err => {
