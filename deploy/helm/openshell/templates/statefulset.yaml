@@ -63,7 +63,7 @@ spec:
             - name: OPENSHELL_SANDBOX_NAMESPACE
               value: {{ .Values.server.sandboxNamespace | quote }}
             - name: OPENSHELL_SANDBOX_IMAGE
-              value: {{ .Values.server.sandboxImage | quote }}
+              value: {{ if .Values.server.sandboxImageDigest }}{{ printf "%s@%s" .Values.server.sandboxImage .Values.server.sandboxImageDigest | quote }}{{ else }}{{ .Values.server.sandboxImage | quote }}{{ end }}
             {{- if .Values.server.sandboxImagePullPolicy }}
             - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.server.sandboxImagePullPolicy | quote }}

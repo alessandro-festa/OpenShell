@@ -73,7 +73,15 @@ server:
   logLevel: info
   sandboxNamespace: openshell
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  # OCI image used for every sandbox pod created by the gateway.
+  # Override with a private registry image to ship a custom sandbox runtime.
+  # Example: registry.example.com/myorg/sandbox:v1.2.3
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+  # Optional OCI digest to pin the sandbox image to an immutable layer.
+  # When set, the value is appended to sandboxImage as @<digest>, taking
+  # precedence over the tag. Example: sha256:abc123...
+  # Leave empty (default) to use the tag specified in sandboxImage.
+  sandboxImageDigest: ""
   # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default
   # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev
   # clusters so new images are picked up without manual eviction.
