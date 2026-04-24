@@ -82,6 +82,10 @@ spec:
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
+            # isolation.mode is read by the aif-nc operator; full multi-namespace
+            # logic is implemented in the operator, not the chart.
+            - name: OPENSHELL_ISOLATION_MODE
+              value: {{ .Values.isolation.mode | quote }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
                 secretKeyRef:
@@ -103,6 +107,17 @@ spec:
             - name: OPENSHELL_DISABLE_GATEWAY_AUTH
               value: "true"
             {{- end }}
+            {{- end }}
+            {{- if .Values.server.inferenceEndpoint }}
+            - name: OPENSHELL_INFERENCE_ENDPOINT
+              value: {{ .Values.server.inferenceEndpoint | quote }}
+            {{- end }}
+            {{- if .Values.server.inferenceCredentialSecretRef }}
+            - name: INFERENCE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.inferenceCredentialSecretRef | quote }}
+                  key: api-key
             {{- end }}
           volumeMounts:
             - name: openshell-data

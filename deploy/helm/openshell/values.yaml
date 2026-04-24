@@ -108,6 +108,13 @@ server:
   # Set to true when the gateway sits behind a reverse proxy (e.g.
   # Cloudflare Tunnel) that terminates TLS.
   disableGatewayAuth: false
+  # Inference endpoint override. When set, passed to the gateway as the
+  # default inference base URL (overrides the blueprint's built-in endpoint).
+  inferenceEndpoint: ""
+  # Name of an existing Kubernetes Secret containing inference credentials.
+  # The secret must have a key named "api-key". When set, the key is mounted
+  # as the INFERENCE_API_KEY env var in the gateway container.
+  inferenceCredentialSecretRef: ""
   # Disable TLS entirely — the server listens on plaintext HTTP.
   # Set to true when a reverse proxy / tunnel terminates TLS at the edge.
   disableTls: false
@@ -118,6 +125,14 @@ server:
     clientCaSecretName: openshell-server-client-ca
     # K8s secret mounted into sandbox pods for mTLS to the server
     clientTlsSecretName: openshell-client-tls
+
+# Isolation mode controls how inference, gateway and sandbox resources are scoped.
+# Modes:
+#   shared   (default) — one inference NS, one gateway NS, sandboxes in individual NSes
+#   isolated — one pod per user containing inference + gateway + sandbox (dedicated NS)
+#   hybrid   — inference + gateway + sandboxes share one NS per group
+isolation:
+  mode: shared
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:
