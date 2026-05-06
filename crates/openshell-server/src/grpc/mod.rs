@@ -3,7 +3,7 @@
 
 //! gRPC service implementation.
 
-pub(crate) mod policy;
+pub mod policy;
 mod provider;
 mod sandbox;
 mod validation;
@@ -15,13 +15,15 @@ use openshell_core::proto::{
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent, ExecSandboxRequest,
     GatewayMessage, GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest,
-    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest,
-    GetSandboxConfigRequest, GetSandboxConfigResponse, GetSandboxLogsRequest,
-    GetSandboxLogsResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    GetDraftPolicyResponse, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
+    HealthRequest, HealthResponse, ListProviderProfilesRequest, ListProviderProfilesResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxPoliciesRequest,
+    ListSandboxPoliciesResponse, ListSandboxesRequest, ListSandboxesResponse,
+    ProviderProfileResponse, ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse,
     RejectDraftChunkRequest, RejectDraftChunkResponse, RelayFrame, ReportPolicyStatusRequest,
     ReportPolicyStatusResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse,
@@ -119,7 +121,9 @@ fn current_time_ms() -> Result<i64, std::time::SystemTimeError> {
 ///
 /// This is a crate-level helper that wraps the validation module's implementation.
 /// Use this from modules outside of `grpc` that need to validate metadata.
-pub(crate) fn validate_object_metadata(
+// `tonic::Status` is large but is the API surface of gRPC handlers.
+#[allow(clippy::result_large_err)]
+pub fn validate_object_metadata(
     metadata: Option<&openshell_core::proto::datamodel::v1::ObjectMeta>,
     resource_type: &str,
 ) -> Result<(), Status> {
@@ -248,6 +252,23 @@ impl OpenShell for OpenShellService {
         request: Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
         provider::handle_list_providers(&self.state, request).await
+    }
+
+    async fn list_provider_profiles(
+        &self,
+        request: Request<ListProviderProfilesRequest>,
+    ) -> Result<Response<ListProviderProfilesResponse>, Status> {
+        Ok(provider::handle_list_provider_profiles(
+            &self.state,
+            request,
+        ))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        request: Request<GetProviderProfileRequest>,
+    ) -> Result<Response<ProviderProfileResponse>, Status> {
+        provider::handle_get_provider_profile(&self.state, request)
     }
 
     async fn update_provider(

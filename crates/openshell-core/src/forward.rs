@@ -135,18 +135,17 @@ pub fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> boo
 /// match is expected.
 pub fn find_forward_by_port(port: u16) -> Result<Option<String>> {
     let dir = forward_pid_dir()?;
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(None),
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(None);
     };
     let suffix = format!("-{port}.pid");
     for entry in entries.flatten() {
         let file_name = entry.file_name();
         let file_name = file_name.to_string_lossy();
-        if let Some(name) = file_name.strip_suffix(&suffix) {
-            if !name.is_empty() {
-                return Ok(Some(name.to_string()));
-            }
+        if let Some(name) = file_name.strip_suffix(&suffix)
+            && !name.is_empty()
+        {
+            return Ok(Some(name.to_string()));
         }
     }
     Ok(None)
@@ -1020,12 +1019,28 @@ mod tests {
     #[test]
     fn check_port_available_free_port() {
         // Bind to port 0 to get an OS-assigned free port, then drop the
-        // listener so the port is released before we test it.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // listener so the port is released before we test it. On busy CI
+        // hosts, another process can claim that single ephemeral port before
+        // we re-bind it, so retry with fresh OS-assigned ports.
+        let mut last_error = None;
+        for _ in 0..20 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
 
-        assert!(check_port_available(&ForwardSpec::new(port)).is_ok());
+            match check_port_available(&ForwardSpec::new(port)) {
+                Ok(()) => return,
+                Err(err) => {
+                    last_error = Some(err.to_string());
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+
+        panic!(
+            "expected an OS-assigned port to be available; last error: {}",
+            last_error.unwrap_or_else(|| "none".to_string())
+        );
     }
 
     #[test]
@@ -1049,9 +1064,8 @@ mod tests {
         // `python3 -m http.server` which listens on [::] by default.  The
         // IPv4-only TcpListener::bind("127.0.0.1", port) might succeed, but
         // lsof should detect the listener and the check should still fail.
-        let listener = match TcpListener::bind("[::]:0") {
-            Ok(l) => l,
-            Err(_) => return, // IPv6 not available, skip
+        let Ok(listener) = TcpListener::bind("[::]:0") else {
+            return; // IPv6 not available, skip
         };
         let port = listener.local_addr().unwrap().port();
 

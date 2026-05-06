@@ -273,9 +273,12 @@ impl ObjectType for Provider {
 
 use crate::ServerState;
 use openshell_core::proto::{
-    CreateProviderRequest, DeleteProviderRequest, DeleteProviderResponse, GetProviderRequest,
-    ListProvidersRequest, ListProvidersResponse, ProviderResponse, UpdateProviderRequest,
+    CreateProviderRequest, DeleteProviderRequest, DeleteProviderResponse,
+    GetProviderProfileRequest, GetProviderRequest, ListProviderProfilesRequest,
+    ListProviderProfilesResponse, ListProvidersRequest, ListProvidersResponse,
+    ProviderProfileResponse, ProviderResponse, UpdateProviderRequest,
 };
+use openshell_providers::{default_profiles, get_default_profile};
 use std::sync::Arc;
 use tonic::{Request, Response};
 
@@ -317,6 +320,40 @@ pub(super) async fn handle_list_providers(
     Ok(Response::new(ListProvidersResponse { providers }))
 }
 
+pub(super) fn handle_list_provider_profiles(
+    _state: &Arc<ServerState>,
+    request: Request<ListProviderProfilesRequest>,
+) -> Response<ListProviderProfilesResponse> {
+    let request = request.into_inner();
+    let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE) as usize;
+    let offset = request.offset as usize;
+    let profiles = default_profiles()
+        .iter()
+        .skip(offset)
+        .take(limit)
+        .map(openshell_providers::ProviderTypeProfile::to_proto)
+        .collect();
+
+    Response::new(ListProviderProfilesResponse { profiles })
+}
+
+pub(super) fn handle_get_provider_profile(
+    _state: &Arc<ServerState>,
+    request: Request<GetProviderProfileRequest>,
+) -> Result<Response<ProviderProfileResponse>, Status> {
+    let id = request.into_inner().id;
+    if id.trim().is_empty() {
+        return Err(Status::invalid_argument("id is required"));
+    }
+    let profile = get_default_profile(id.trim())
+        .ok_or_else(|| Status::not_found("provider profile not found"))?
+        .to_proto();
+
+    Ok(Response::new(ProviderProfileResponse {
+        profile: Some(profile),
+    }))
+}
+
 pub(super) async fn handle_update_provider(
     state: &Arc<ServerState>,
     request: Request<UpdateProviderRequest>,
@@ -349,10 +386,21 @@ pub(super) async fn handle_delete_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ServerState;
+    use crate::compute::new_test_runtime;
     use crate::grpc::MAX_MAP_KEY_LEN;
+    use crate::sandbox_index::SandboxIndex;
+    use crate::sandbox_watch::SandboxWatchBus;
+    use crate::supervisor_session::SupervisorSessionRegistry;
+    use crate::tracing_bus::TracingLogBus;
+    use openshell_core::Config;
+    use openshell_core::proto::{
+        GetProviderProfileRequest, ListProviderProfilesRequest, ProviderProfileCategory,
+    };
     use openshell_core::{ObjectId, ObjectName};
     use std::collections::HashMap;
-    use tonic::Code;
+    use std::sync::Arc;
+    use tonic::{Code, Request};
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -395,6 +443,86 @@ mod tests {
         }
     }
 
+    async fn test_server_state() -> Arc<ServerState> {
+        let store = Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let compute = new_test_runtime(store.clone()).await;
+        Arc::new(ServerState::new(
+            Config::new(None)
+                .with_database_url("sqlite::memory:?cache=shared")
+                .with_ssh_handshake_secret("test-secret"),
+            store,
+            compute,
+            SandboxIndex::new(),
+            SandboxWatchBus::new(),
+            TracingLogBus::new(),
+            Arc::new(SupervisorSessionRegistry::new()),
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn list_provider_profiles_returns_built_in_profile_categories() {
+        let state = test_server_state().await;
+        let response = handle_list_provider_profiles(
+            &state,
+            Request::new(ListProviderProfilesRequest {
+                limit: 100,
+                offset: 0,
+            }),
+        )
+        .into_inner();
+
+        let github = response
+            .profiles
+            .iter()
+            .find(|profile| profile.id == "github")
+            .expect("github profile should be listed");
+        assert_eq!(
+            github.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
+        assert!(
+            response
+                .profiles
+                .iter()
+                .all(|profile| profile.id != "generic"),
+            "generic remains a legacy provider type without a v2 profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_provider_profile_returns_profile_or_not_found() {
+        let state = test_server_state().await;
+        let github = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "github".to_string(),
+            }),
+        )
+        .unwrap()
+        .into_inner()
+        .profile
+        .expect("github profile should be returned");
+        assert_eq!(github.id, "github");
+        assert_eq!(
+            github.category,
+            ProviderProfileCategory::SourceControl as i32
+        );
+
+        let generic_err = handle_get_provider_profile(
+            &state,
+            Request::new(GetProviderProfileRequest {
+                id: "generic".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(generic_err.code(), Code::NotFound);
+    }
+
     #[tokio::test]
     async fn provider_crud_round_trip_and_semantics() {
         let store = Store::connect("sqlite::memory:?cache=shared")
@@ -426,8 +554,8 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "gitlab-local".to_string(),
-                    created_at_ms: 1000000,
-                    labels: std::collections::HashMap::new(),
+                    created_at_ms: 1_000_000,
+                    labels: HashMap::new(),
                 }),
                 r#type: "gitlab".to_string(),
                 credentials: std::iter::once((
@@ -499,7 +627,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "bad-provider".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
@@ -523,7 +651,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "missing".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
@@ -551,7 +679,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "noop-test".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: String::new(),
@@ -614,13 +742,13 @@ mod tests {
             updated.credentials.get("API_TOKEN"),
             Some(&"REDACTED".to_string())
         );
-        assert!(updated.credentials.get("SECONDARY").is_none());
+        assert!(!updated.credentials.contains_key("SECONDARY"));
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
             Some(&"https://example.com".to_string())
         );
-        assert!(updated.config.get("region").is_none());
+        assert!(!updated.config.contains_key("region"));
         let stored: Provider = store
             .get_message_by_name("delete-key-test")
             .await
@@ -631,7 +759,7 @@ mod tests {
             stored.credentials.get("API_TOKEN"),
             Some(&"token-123".to_string())
         );
-        assert!(stored.credentials.get("SECONDARY").is_none());
+        assert!(!stored.credentials.contains_key("SECONDARY"));
     }
 
     #[tokio::test]
@@ -916,7 +1044,7 @@ mod tests {
                 metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                     id: String::new(),
                     name: "my-claude".to_string(),
-                    created_at_ms: 1000000,
+                    created_at_ms: 1_000_000,
                     labels: HashMap::new(),
                 }),
                 r#type: "claude".to_string(),
@@ -935,8 +1063,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-001".to_string(),
                 name: "test-sandbox".to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             spec: Some(SandboxSpec {
                 providers: vec!["my-claude".to_string()],
@@ -971,8 +1099,8 @@ mod tests {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 id: "sandbox-002".to_string(),
                 name: "empty-sandbox".to_string(),
-                created_at_ms: 1000000,
-                labels: std::collections::HashMap::new(),
+                created_at_ms: 1_000_000,
+                labels: HashMap::new(),
             }),
             spec: Some(SandboxSpec::default()),
             status: None,

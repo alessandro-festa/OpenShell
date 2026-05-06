@@ -30,7 +30,7 @@ jobs:
   # ---------------------------------------------------------------------------
   compute-versions:
     name: Compute Versions
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 5
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -40,10 +40,11 @@ jobs:
     outputs:
       python_version: ${{ steps.v.outputs.python }}
       cargo_version: ${{ steps.v.outputs.cargo }}
+      deb_version: ${{ steps.v.outputs.deb }}
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -60,6 +61,7 @@ jobs:
           set -euo pipefail
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          echo "deb=$(uv run python tasks/scripts/release.py get-version --deb)" >> "$GITHUB_OUTPUT"
           echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
   build-gateway:
@@ -88,12 +90,12 @@ jobs:
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
-      runner: build-arm64
+      runner: linux-arm64-cpu8
 
   tag-ghcr-release:
     name: Tag GHCR Images for Release
     needs: [compute-versions, build-gateway, build-supervisor, build-cluster, e2e]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     steps:
       - name: Log in to GHCR
@@ -123,12 +125,12 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             artifact: linux-amd64
             task: python:build:linux:amd64
             output_path: target/wheels/linux-amd64/*.whl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             artifact: linux-arm64
             task: python:build:linux:arm64
             output_path: target/wheels/linux-arm64/*.whl
@@ -142,10 +144,9 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -179,7 +180,7 @@ jobs:
   build-python-wheel-macos:
     name: Build Python Wheel (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 120
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -191,10 +192,9 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -204,6 +204,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -237,11 +239,11 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-musl
             zig_target: x86_64-linux-musl
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-musl
             zig_target: aarch64-linux-musl
     runs-on: ${{ matrix.runner }}
@@ -254,10 +256,9 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -346,7 +347,7 @@ jobs:
   build-cli-macos:
     name: Build CLI (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -358,9 +359,8 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -376,6 +376,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Build macOS binary via Docker
         run: |
@@ -414,10 +416,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -429,9 +431,8 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -499,10 +500,10 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: build-amd64
+            runner: linux-amd64-cpu8
             target: x86_64-unknown-linux-gnu
           - arch: arm64
-            runner: build-arm64
+            runner: linux-arm64-cpu8
             target: aarch64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
@@ -514,9 +515,8 @@ jobs:
       options: --privileged
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -580,7 +580,7 @@ jobs:
   build-gateway-binary-macos:
     name: Build Gateway Binary (macOS)
     needs: [compute-versions]
-    runs-on: build-amd64
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -592,9 +592,8 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
@@ -610,6 +609,8 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
+        with:
+          driver: local
 
       - name: Build macOS binary via Docker
         run: |
@@ -642,18 +643,45 @@ jobs:
           path: artifacts/*.tar.gz
           retention-days: 5
 
+  build-driver-vm-linux:
+    name: Build Driver VM Linux
+    needs: [compute-versions]
+    uses: ./.github/workflows/driver-vm-linux.yml
+    with:
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      image-tag: ${{ needs.compute-versions.outputs.semver }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  build-deb:
+    name: Build Debian Packages
+    needs: [compute-versions, build-cli-linux, build-gateway-binary-linux, build-driver-vm-linux]
+    uses: ./.github/workflows/deb-package.yml
+    with:
+      deb-version: ${{ needs.compute-versions.outputs.deb_version }}
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
+  build-rpm:
+    name: Build RPM Packages
+    needs: [compute-versions]
+    uses: ./.github/workflows/rpm-package.yml
+    with:
+      checkout-ref: ${{ inputs.tag || github.ref }}
+    secrets: inherit
+
   # ---------------------------------------------------------------------------
   # Create a tagged GitHub Release with CLI binaries and wheels
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release]
-    runs-on: build-amd64
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-gateway-binary-linux, build-gateway-binary-macos, build-supervisor-binary-linux, build-python-wheels-linux, build-python-wheel-macos, tag-ghcr-release, build-deb, build-rpm]
+    runs-on: linux-amd64-cpu8
     timeout-minutes: 10
     outputs:
       wheel_filenames: ${{ steps.wheel_filenames.outputs.wheel_filenames }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 
@@ -685,6 +713,20 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download Debian package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: deb-linux-*
+          path: release/
+          merge-multiple: true
+
+      - name: Download RPM package artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rpm-linux-*
+          path: release/
+          merge-multiple: true
+
       - name: Capture wheel filenames
         id: wheel_filenames
         run: |
@@ -701,6 +743,8 @@ jobs:
             openshell-x86_64-unknown-linux-musl.tar.gz \
             openshell-aarch64-unknown-linux-musl.tar.gz \
             openshell-aarch64-apple-darwin.tar.gz \
+            openshell_*.deb \
+            openshell-*.rpm \
             *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
           sha256sum \
@@ -733,6 +777,8 @@ jobs:
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell_*.deb
+            release/openshell-*.rpm
             release/openshell-gateway-x86_64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-unknown-linux-gnu.tar.gz
             release/openshell-gateway-aarch64-apple-darwin.tar.gz
@@ -749,7 +795,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.tag || github.ref }}
 

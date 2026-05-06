@@ -177,6 +177,20 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -336,15 +350,14 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 

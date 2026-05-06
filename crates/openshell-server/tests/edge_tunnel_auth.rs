@@ -12,7 +12,7 @@
 //!
 //! Test matrix:
 //!
-//! | allow_unauthenticated | client cert | bearer auth header | expected |
+//! | `allow_unauthenticated` | client cert | bearer auth header | expected |
 //! |-----------------------|-------------|--------------------|----------|
 //! | false                 | valid       | —                  | OK       |
 //! | false                 | none        | —                  | rejected |
@@ -69,7 +69,7 @@ fn install_rustls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Minimal OpenShell implementation for testing.
+/// Minimal `OpenShell` implementation for testing.
 #[derive(Clone, Default)]
 struct TestOpenShell;
 
@@ -168,6 +168,20 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -317,15 +331,13 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
-        Result<openshell_core::proto::RelayFrame, tonic::Status>,
-    >;
+    type RelayStreamStream = ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
         _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
-    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not implemented in test"))
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 }
 
@@ -575,7 +587,7 @@ fn https_client_no_cert(
 // Tests
 // ===========================================================================
 
-/// Baseline: with allow_unauthenticated=false (default), mTLS connections work.
+/// Baseline: with `allow_unauthenticated=false` (default), mTLS connections work.
 #[tokio::test]
 async fn baseline_mtls_works_with_mandatory_client_certs() {
     install_rustls_provider();
@@ -615,7 +627,7 @@ async fn baseline_mtls_works_with_mandatory_client_certs() {
     server.abort();
 }
 
-/// Baseline: with allow_unauthenticated=false, no-client-cert connections are
+/// Baseline: with `allow_unauthenticated=false`, no-client-cert connections are
 /// rejected at the TLS layer.
 #[tokio::test]
 async fn baseline_no_cert_rejected_with_mandatory_mtls() {
@@ -655,7 +667,7 @@ async fn baseline_no_cert_rejected_with_mandatory_mtls() {
     server.abort();
 }
 
-/// With allow_unauthenticated=true, mTLS connections still work (dual-auth).
+/// With `allow_unauthenticated=true`, mTLS connections still work (dual-auth).
 #[tokio::test]
 async fn dual_auth_mtls_still_accepted() {
     install_rustls_provider();
@@ -695,7 +707,7 @@ async fn dual_auth_mtls_still_accepted() {
     server.abort();
 }
 
-/// With allow_unauthenticated=true, no-client-cert connections pass the TLS
+/// With `allow_unauthenticated=true`, no-client-cert connections pass the TLS
 /// handshake. This simulates Cloudflare Tunnel re-originating a connection.
 ///
 /// The gRPC health check succeeds because there is no auth middleware yet —
@@ -777,7 +789,7 @@ async fn tunnel_mode_cf_authorization_header_reaches_server() {
     server.abort();
 }
 
-/// With allow_unauthenticated=true, a client cert from a rogue CA is still
+/// With `allow_unauthenticated=true`, a client cert from a rogue CA is still
 /// rejected by the TLS layer — the verifier still validates presented certs.
 #[tokio::test]
 async fn tunnel_mode_rogue_cert_still_rejected() {

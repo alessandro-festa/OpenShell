@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared sandbox policy parsing and defaults for OpenShell.
+//! Shared sandbox policy parsing and defaults for `OpenShell`.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
@@ -9,6 +9,7 @@
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
 //! these types, ensuring round-trip fidelity.
 
+mod compose;
 mod merge;
 
 use std::collections::{BTreeMap, HashMap};
@@ -17,11 +18,13 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
+    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
+    SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
+pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
 pub use merge::{
     PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
     merge_policy,
@@ -88,6 +91,8 @@ struct NetworkPolicyRuleDef {
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    path: String,
     /// Single port (backwards compat). Mutually exclusive with `ports`.
     /// Uses `u16` to reject invalid values >65535 at parse time.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -115,10 +120,35 @@ struct NetworkEndpointDef {
     /// Defaults to false (strict).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     allow_encoded_slash: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    persisted_queries: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    graphql_max_body_bytes: u32,
 }
 
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_zero(v: &u16) -> bool {
     *v == 0
+}
+
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphqlOperationDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -138,6 +168,12 @@ struct L7AllowDef {
     command: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     query: BTreeMap<String, QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -165,6 +201,12 @@ struct L7DenyRuleDef {
     command: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     query: BTreeMap<String, QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +249,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                         };
                         NetworkEndpoint {
                             host: e.host,
+                            path: e.path,
                             port: normalized_ports.first().copied().unwrap_or(0),
                             ports: normalized_ports,
                             protocol: e.protocol,
@@ -221,6 +264,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         method: r.allow.method,
                                         path: r.allow.path,
                                         command: r.allow.command,
+                                        operation_type: r.allow.operation_type,
+                                        operation_name: r.allow.operation_name,
+                                        fields: r.allow.fields,
                                         query: r
                                             .allow
                                             .query
@@ -249,6 +295,9 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     method: d.method,
                                     path: d.path,
                                     command: d.command,
+                                    operation_type: d.operation_type,
+                                    operation_name: d.operation_name,
+                                    fields: d.fields,
                                     query: d
                                         .query
                                         .into_iter()
@@ -268,6 +317,22 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            persisted_queries: e.persisted_queries,
+                            graphql_persisted_queries: e
+                                .graphql_persisted_queries
+                                .into_iter()
+                                .map(|(key, op)| {
+                                    (
+                                        key,
+                                        GraphqlOperation {
+                                            operation_type: op.operation_type,
+                                            operation_name: op.operation_name,
+                                            fields: op.fields,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            graphql_max_body_bytes: e.graphql_max_body_bytes,
                         }
                     })
                     .collect(),
@@ -349,6 +414,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                         };
                         NetworkEndpointDef {
                             host: e.host.clone(),
+                            path: e.path.clone(),
                             port,
                             ports,
                             protocol: e.protocol.clone(),
@@ -365,16 +431,19 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             method: a.method,
                                             path: a.path,
                                             command: a.command,
+                                            operation_type: a.operation_type,
+                                            operation_name: a.operation_name,
+                                            fields: a.fields,
                                             query: a
                                                 .query
                                                 .into_iter()
                                                 .map(|(key, matcher)| {
-                                                    let yaml_matcher = if !matcher.any.is_empty() {
+                                                    let yaml_matcher = if matcher.any.is_empty() {
+                                                        QueryMatcherDef::Glob(matcher.glob)
+                                                    } else {
                                                         QueryMatcherDef::Any(QueryAnyDef {
                                                             any: matcher.any,
                                                         })
-                                                    } else {
-                                                        QueryMatcherDef::Glob(matcher.glob)
                                                     };
                                                     (key, yaml_matcher)
                                                 })
@@ -391,16 +460,19 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     method: d.method.clone(),
                                     path: d.path.clone(),
                                     command: d.command.clone(),
+                                    operation_type: d.operation_type.clone(),
+                                    operation_name: d.operation_name.clone(),
+                                    fields: d.fields.clone(),
                                     query: d
                                         .query
                                         .iter()
                                         .map(|(key, matcher)| {
-                                            let yaml_matcher = if !matcher.any.is_empty() {
+                                            let yaml_matcher = if matcher.any.is_empty() {
+                                                QueryMatcherDef::Glob(matcher.glob.clone())
+                                            } else {
                                                 QueryMatcherDef::Any(QueryAnyDef {
                                                     any: matcher.any.clone(),
                                                 })
-                                            } else {
-                                                QueryMatcherDef::Glob(matcher.glob.clone())
                                             };
                                             (key.clone(), yaml_matcher)
                                         })
@@ -408,6 +480,22 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allow_encoded_slash: e.allow_encoded_slash,
+                            persisted_queries: e.persisted_queries.clone(),
+                            graphql_persisted_queries: e
+                                .graphql_persisted_queries
+                                .iter()
+                                .map(|(key, op)| {
+                                    (
+                                        key.clone(),
+                                        GraphqlOperationDef {
+                                            operation_type: op.operation_type.clone(),
+                                            operation_name: op.operation_name.clone(),
+                                            fields: op.fields.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            graphql_max_body_bytes: e.graphql_max_body_bytes,
                         }
                     })
                     .collect(),
@@ -535,9 +623,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
 /// the required `"sandbox"` value. Call this before validation so that
 /// policies without an explicit process section get the correct default.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
-    let process = policy
-        .process
-        .get_or_insert_with(|| ProcessPolicy::default());
+    let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
         process.run_as_user = "sandbox".into();
     }
@@ -812,7 +898,7 @@ network_policies:
     /// Verify that the network policy `name` field survives the round-trip.
     #[test]
     fn round_trip_preserves_policy_name() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   my_api:
@@ -822,7 +908,7 @@ network_policies:
         port: 443
     binaries:
       - path: /usr/bin/curl
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto1.network_policies["my_api"].name, "my-custom-api-name");
 
@@ -891,7 +977,7 @@ network_policies:
 
     #[test]
     fn parse_policy_with_network_rules() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -900,7 +986,7 @@ network_policies:
       - { host: example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         assert_eq!(policy.network_policies.len(), 1);
         let rule = &policy.network_policies["test"];
@@ -1277,7 +1363,7 @@ network_policies:
 
     #[test]
     fn parse_ports_array() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1286,7 +1372,7 @@ network_policies:
       - { host: api.example.com, ports: [80, 443] }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![80, 443]);
@@ -1296,7 +1382,7 @@ network_policies:
 
     #[test]
     fn parse_single_port_normalized_to_ports() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1305,7 +1391,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![443]);
@@ -1313,8 +1399,36 @@ network_policies:
     }
 
     #[test]
-    fn round_trip_preserves_multi_port() {
+    fn round_trip_preserves_endpoint_path() {
         let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: api.example.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        rules:
+          - allow:
+              operation_type: query
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep1 = &proto1.network_policies["test"].endpoints[0];
+        let ep2 = &proto2.network_policies["test"].endpoints[0];
+        assert_eq!(ep1.path, "/graphql");
+        assert_eq!(ep1.path, ep2.path);
+    }
+
+    #[test]
+    fn round_trip_preserves_multi_port() {
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1326,7 +1440,7 @@ network_policies:
           - 443
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
@@ -1339,7 +1453,7 @@ network_policies:
 
     #[test]
     fn serialize_single_port_uses_compact_form() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1348,7 +1462,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         // Should use compact `port: 443` form, not `ports: [443]`
@@ -1492,8 +1606,59 @@ network_policies:
     }
 
     #[test]
+    fn round_trip_preserves_graphql_policy_fields() {
+        let yaml = r"
+version: 1
+network_policies:
+  github_graphql:
+    name: github_graphql
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_max_body_bytes: 131072
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["github_graphql"].endpoints[0];
+        assert_eq!(ep.protocol, "graphql");
+        assert_eq!(ep.persisted_queries, "allow_registered");
+        assert_eq!(ep.graphql_max_body_bytes, 131_072);
+        assert_eq!(
+            ep.graphql_persisted_queries["abc123"].operation_type,
+            "query"
+        );
+        assert_eq!(ep.rules[0].allow.as_ref().unwrap().operation_type, "query");
+        assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
+        assert_eq!(ep.deny_rules[0].operation_type, "mutation");
+        assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
+    }
+
+    #[test]
     fn parse_rejects_unknown_fields_in_deny_rule() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1504,20 +1669,20 @@ network_policies:
           - method: POST
             path: /foo
             bogus: true
-"#;
+";
         assert!(parse_sandbox_policy(yaml).is_err());
     }
 
     #[test]
     fn rejects_port_above_65535() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
     endpoints:
       - host: example.com
         port: 70000
-"#;
+";
         assert!(
             parse_sandbox_policy(yaml).is_err(),
             "port >65535 should fail to parse"

@@ -7,9 +7,10 @@ use clap::{Command, CommandFactory, FromArgMatches, Parser};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::ComputeDriverKind;
 use openshell_core::config::{
-    DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS, DEFAULT_SSH_PORT,
+    DEFAULT_DOCKER_NETWORK_NAME, DEFAULT_SERVER_PORT, DEFAULT_SSH_HANDSHAKE_SKEW_SECS,
+    DEFAULT_SSH_PORT,
 };
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -22,7 +23,11 @@ use crate::{run_server, tracing_bus::TracingLogBus};
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
-    /// Port to bind the server to (all interfaces).
+    /// IP address to bind the server, health, and metrics listeners to.
+    #[arg(long, default_value = "127.0.0.1", env = "OPENSHELL_BIND_ADDRESS")]
+    bind_address: IpAddr,
+
+    /// Port to bind the server to.
     #[arg(long, default_value_t = DEFAULT_SERVER_PORT, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
 
@@ -61,12 +66,14 @@ struct Args {
     /// Accepts a comma-delimited list such as `kubernetes` or
     /// `kubernetes,podman`. The configuration format is future-proofed for
     /// multiple drivers, but the gateway currently requires exactly one.
+    /// When unset, the gateway auto-detects the driver based on the runtime
+    /// environment (Kubernetes → Podman → Docker). VM is never auto-detected
+    /// and requires explicit configuration.
     #[arg(
         long,
         alias = "driver",
         env = "OPENSHELL_DRIVERS",
         value_delimiter = ',',
-        default_value = "kubernetes",
         value_parser = parse_compute_driver
     )]
     drivers: Vec<ComputeDriverKind>,
@@ -79,7 +86,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
-    /// Kubernetes imagePullPolicy for sandbox pods (Always, IfNotPresent, Never).
+    /// Kubernetes `imagePullPolicy` for sandbox pods (Always, `IfNotPresent`, Never).
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
     sandbox_image_pull_policy: Option<String>,
 
@@ -136,8 +143,9 @@ struct Args {
     /// Directory searched for compute-driver binaries (e.g.
     /// `openshell-driver-vm`) when an explicit binary override isn't
     /// configured. When unset, the gateway searches
-    /// `$HOME/.local/libexec/openshell`, `/usr/local/libexec/openshell`,
-    /// `/usr/local/libexec`, then a sibling of the gateway binary.
+    /// `$HOME/.local/libexec/openshell`, `/usr/libexec/openshell`,
+    /// `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling
+    /// of the gateway binary.
     #[arg(long, env = "OPENSHELL_DRIVER_DIR")]
     driver_dir: Option<PathBuf>,
 
@@ -204,6 +212,14 @@ struct Args {
     #[arg(long, env = "OPENSHELL_DOCKER_TLS_KEY")]
     docker_tls_key: Option<PathBuf>,
 
+    /// Docker bridge network used for sandbox containers.
+    #[arg(
+        long,
+        env = "OPENSHELL_DOCKER_NETWORK_NAME",
+        default_value = DEFAULT_DOCKER_NETWORK_NAME
+    )]
+    docker_network_name: String,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -215,6 +231,51 @@ struct Args {
     /// certificate. Ignored when --disable-tls is set.
     #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
     disable_gateway_auth: bool,
+
+    /// OIDC issuer URL for JWT-based authentication.
+    /// When set, the server validates `authorization: Bearer` tokens on gRPC
+    /// requests against the issuer's JWKS endpoint.
+    #[arg(long, env = "OPENSHELL_OIDC_ISSUER")]
+    oidc_issuer: Option<String>,
+
+    /// Expected OIDC audience claim (typically the client ID).
+    #[arg(long, env = "OPENSHELL_OIDC_AUDIENCE", default_value = "openshell-cli")]
+    oidc_audience: String,
+
+    /// JWKS key cache TTL in seconds.
+    #[arg(long, env = "OPENSHELL_OIDC_JWKS_TTL", default_value_t = 3600)]
+    oidc_jwks_ttl: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Keycloak: `realm_access.roles` (default). Entra ID: "roles". Okta: "groups".
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ROLES_CLAIM",
+        default_value = "realm_access.roles"
+    )]
+    oidc_roles_claim: String,
+
+    /// Role name that grants admin access.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_ADMIN_ROLE",
+        default_value = "openshell-admin"
+    )]
+    oidc_admin_role: String,
+
+    /// Role name that grants standard user access.
+    #[arg(
+        long,
+        env = "OPENSHELL_OIDC_USER_ROLE",
+        default_value = "openshell-user"
+    )]
+    oidc_user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When set, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: "scope". Okta: "scp". Leave empty to disable scope enforcement.
+    #[arg(long, env = "OPENSHELL_OIDC_SCOPES_CLAIM", default_value = "")]
+    oidc_scopes_claim: String,
 }
 
 pub fn command() -> Command {
@@ -230,7 +291,7 @@ pub async fn run_cli() -> Result<()> {
 
     let args = Args::from_arg_matches(&command().get_matches()).expect("clap validated args");
 
-    run_from_args(args).await
+    Box::pin(run_from_args(args)).await
 }
 
 async fn run_from_args(args: Args) -> Result<()> {
@@ -239,7 +300,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level)),
     );
 
-    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
+    let bind = SocketAddr::new(args.bind_address, args.port);
 
     let tls = if args.disable_tls {
         None
@@ -276,7 +337,7 @@ async fn run_from_args(args: Args) -> Result<()> {
                 args.port
             ));
         }
-        let health_bind = SocketAddr::from(([0, 0, 0, 0], args.health_port));
+        let health_bind = SocketAddr::new(args.bind_address, args.health_port);
         config = config.with_health_bind_address(health_bind);
     }
 
@@ -293,7 +354,7 @@ async fn run_from_args(args: Args) -> Result<()> {
                 args.health_port
             ));
         }
-        let metrics_bind = SocketAddr::from(([0, 0, 0, 0], args.metrics_port));
+        let metrics_bind = SocketAddr::new(args.bind_address, args.metrics_port);
         config = config.with_metrics_bind_address(metrics_bind);
     }
 
@@ -331,9 +392,22 @@ async fn run_from_args(args: Args) -> Result<()> {
         config = config.with_host_gateway_ip(ip);
     }
 
+    if let Some(issuer) = args.oidc_issuer {
+        config = config.with_oidc(openshell_core::OidcConfig {
+            issuer,
+            audience: args.oidc_audience,
+            jwks_ttl_secs: args.oidc_jwks_ttl,
+            roles_claim: args.oidc_roles_claim,
+            admin_role: args.oidc_admin_role,
+            user_role: args.oidc_user_role,
+            scopes_claim: args.oidc_scopes_claim,
+        });
+    }
+
     let vm_config = VmComputeConfig {
         state_dir: args.vm_driver_state_dir,
         driver_dir: args.driver_dir,
+        default_image: config.sandbox_image.clone(),
         krun_log_level: args.vm_krun_log_level,
         vcpus: args.vm_vcpus,
         mem_mib: args.vm_mem_mib,
@@ -348,6 +422,7 @@ async fn run_from_args(args: Args) -> Result<()> {
         guest_tls_ca: args.docker_tls_ca,
         guest_tls_cert: args.docker_tls_cert,
         guest_tls_key: args.docker_tls_key,
+        network_name: args.docker_network_name,
     };
 
     if args.disable_tls {
@@ -369,7 +444,47 @@ fn parse_compute_driver(value: &str) -> std::result::Result<ComputeDriverKind, S
 
 #[cfg(test)]
 mod tests {
-    use super::command;
+    use super::{Args, command};
+    use clap::Parser;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{LazyLock, Mutex};
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        #[allow(unsafe_code)]
+        fn remove(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            // SAFETY: tests serialize environment mutation with ENV_LOCK.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.original.as_deref() {
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                // SAFETY: tests serialize environment mutation with ENV_LOCK.
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
 
     #[test]
     fn command_uses_gateway_binary_name() {
@@ -384,5 +499,46 @@ mod tests {
         let cmd = command();
         let version = cmd.get_version().unwrap();
         assert_eq!(version.to_string(), openshell_core::VERSION);
+    }
+
+    #[test]
+    fn command_defaults_bind_address_to_loopback() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
+        let args =
+            Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"]).unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn command_parses_bind_address() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::remove("OPENSHELL_BIND_ADDRESS");
+        let args = Args::try_parse_from([
+            "openshell-gateway",
+            "--db-url",
+            "sqlite::memory:",
+            "--bind-address",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn command_reads_bind_address_from_env() {
+        let _lock = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _guard = EnvVarGuard::set("OPENSHELL_BIND_ADDRESS", "0.0.0.0");
+
+        let args = Args::try_parse_from(["openshell-gateway", "--db-url", "sqlite::memory:"])
+            .expect("env should provide bind address");
+
+        assert_eq!(args.bind_address, IpAddr::V4(Ipv4Addr::UNSPECIFIED));
     }
 }

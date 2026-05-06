@@ -44,9 +44,11 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - --bind-address
+            - "0.0.0.0"
             - --port
             - {{ .Values.service.port | quote }}
             - --health-port
@@ -67,6 +69,12 @@ spec:
             {{- if .Values.server.sandboxImagePullPolicy }}
             - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.server.sandboxImagePullPolicy | quote }}
+            {{- end }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE
+              value: {{ include "openshell.supervisorImage" . | quote }}
+            {{- if .Values.supervisor.image.pullPolicy }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY
+              value: {{ .Values.supervisor.image.pullPolicy | quote }}
             {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
@@ -102,6 +110,30 @@ spec:
             {{- if .Values.server.disableGatewayAuth }}
             - name: OPENSHELL_DISABLE_GATEWAY_AUTH
               value: "true"
+            {{- end }}
+            {{- end }}
+            {{- if .Values.server.oidc.issuer }}
+            - name: OPENSHELL_OIDC_ISSUER
+              value: {{ .Values.server.oidc.issuer | quote }}
+            - name: OPENSHELL_OIDC_AUDIENCE
+              value: {{ .Values.server.oidc.audience | quote }}
+            - name: OPENSHELL_OIDC_JWKS_TTL
+              value: {{ .Values.server.oidc.jwksTtl | quote }}
+            {{- if .Values.server.oidc.rolesClaim }}
+            - name: OPENSHELL_OIDC_ROLES_CLAIM
+              value: {{ .Values.server.oidc.rolesClaim | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.adminRole }}
+            - name: OPENSHELL_OIDC_ADMIN_ROLE
+              value: {{ .Values.server.oidc.adminRole | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.userRole }}
+            - name: OPENSHELL_OIDC_USER_ROLE
+              value: {{ .Values.server.oidc.userRole | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.scopesClaim }}
+            - name: OPENSHELL_OIDC_SCOPES_CLAIM
+              value: {{ .Values.server.oidc.scopesClaim | quote }}
             {{- end }}
             {{- end }}
           volumeMounts:
@@ -159,7 +191,14 @@ spec:
             secretName: {{ .Values.server.tls.certSecretName }}
         - name: tls-client-ca
           secret:
+            {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            secretName: {{ .Values.server.tls.certSecretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            {{- else }}
             secretName: {{ .Values.server.tls.clientCaSecretName }}
+            {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

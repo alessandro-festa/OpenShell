@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Gateway metadata stored alongside deployment info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayMetadata {
     /// The gateway name.
     pub name: String,
@@ -46,6 +46,41 @@ pub struct GatewayMetadata {
         alias = "cf_auth_url"
     )]
     pub edge_auth_url: Option<String>,
+
+    /// OIDC issuer URL (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_issuer: Option<String>,
+
+    /// OIDC client ID for the CLI login flow (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_client_id: Option<String>,
+
+    /// OIDC audience for the resource server (API). When different from
+    /// `client_id`, the CLI requests this audience in the token exchange.
+    /// When `None`, defaults to the `client_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_audience: Option<String>,
+
+    /// Space-separated `OAuth2` scopes to request during OIDC login.
+    /// When set, tokens will include these scopes for fine-grained access control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_scopes: Option<String>,
+
+    /// Local VM driver state directory for standalone VM gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_driver_state_dir: Option<PathBuf>,
+
+    /// Whether the CLI manages this gateway's full lifecycle (deploy,
+    /// stop, destroy).
+    ///
+    /// - `Some(true)` — deployed via `gateway start`; destroy/stop operate on
+    ///   the underlying container or VM.
+    /// - `Some(false)` — registered via `gateway add`; destroy/stop only remove
+    ///   the local registration metadata.
+    /// - `None` — legacy metadata written before this field existed; the CLI
+    ///   falls back to the previous heuristic (`is_remote`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_lifecycle_managed: Option<bool>,
 }
 
 impl GatewayMetadata {
@@ -134,8 +169,8 @@ pub fn create_gateway_metadata_with_host(
         remote_host,
         resolved_host,
         auth_mode: disable_tls.then(|| "plaintext".to_string()),
-        edge_team_domain: None,
-        edge_auth_url: None,
+        client_lifecycle_managed: Some(true),
+        ..Default::default()
     }
 }
 
@@ -305,12 +340,11 @@ pub fn load_last_sandbox(gateway: &str) -> Option<String> {
 /// This should be called after a sandbox is deleted so that subsequent commands
 /// don't try to connect to a sandbox that no longer exists.
 pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
-    if let Some(current) = load_last_sandbox(gateway) {
-        if current == sandbox {
-            if let Ok(path) = last_sandbox_path(gateway) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
+    if let Some(current) = load_last_sandbox(gateway)
+        && current == sandbox
+        && let Ok(path) = last_sandbox_path(gateway)
+    {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -461,9 +495,7 @@ mod tests {
             gateway_port: 8080,
             remote_host: Some("user@openshell-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -485,6 +517,53 @@ mod tests {
         }"#;
         let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
+    }
+
+    #[test]
+    fn metadata_deserialize_without_client_lifecycle_managed_field() {
+        // Legacy metadata files won't have the client_lifecycle_managed field.
+        // Ensure backwards compatibility: defaults to None.
+        let json = r#"{
+            "name": "test",
+            "gateway_endpoint": "https://127.0.0.1:8080",
+            "is_remote": false,
+            "gateway_port": 8080
+        }"#;
+        let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.client_lifecycle_managed, None);
+    }
+
+    #[test]
+    fn metadata_roundtrip_with_client_lifecycle_managed_field() {
+        let meta = GatewayMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            gateway_port: 8080,
+            client_lifecycle_managed: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains(r#""client_lifecycle_managed":false"#));
+        let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.client_lifecycle_managed, Some(false));
+    }
+
+    #[test]
+    fn metadata_omits_client_lifecycle_managed_when_none() {
+        let meta = GatewayMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            gateway_port: 8080,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("client_lifecycle_managed"));
+    }
+
+    #[test]
+    fn create_gateway_metadata_sets_client_lifecycle_managed_true() {
+        let meta = create_gateway_metadata("test", None, 8080);
+        assert_eq!(meta.client_lifecycle_managed, Some(true));
     }
 
     #[test]
@@ -552,13 +631,8 @@ mod tests {
         let meta = GatewayMetadata {
             name: "t".into(),
             gateway_endpoint: "https://localhost:8080".into(),
-            is_remote: false,
             gateway_port: 8080,
-            remote_host: None,
-            resolved_host: None,
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         assert_eq!(meta.gateway_host(), None);
     }
@@ -572,9 +646,7 @@ mod tests {
             gateway_port: 8080,
             remote_host: Some("user@10.0.0.5".into()),
             resolved_host: Some("10.0.0.5".into()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
     }

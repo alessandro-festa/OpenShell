@@ -31,7 +31,7 @@ The YAML data file is preprocessed before loading into the OPA engine: L7 polici
 
 ### gRPC Mode (Production)
 
-When the sandbox runs inside a managed cluster, it fetches its typed protobuf policy from the gateway:
+When the sandbox runs under a gateway-managed compute platform, it fetches its typed protobuf policy from the gateway:
 
 ```bash
 openshell-sandbox \
@@ -203,7 +203,7 @@ The poll loop:
 2. Fetches the current policy via `GetSandboxSettings`, which returns the latest version, its policy payload, and a SHA-256 hash.
 3. Compares the returned version against the locally tracked `current_version`. If the server version is not greater, the loop sleeps and retries.
 4. On a new version, calls `OpaEngine::reload_from_proto()` which builds a complete new `regorus::Engine` through the same validated pipeline as the initial load (proto-to-JSON conversion, L7 validation, access preset expansion).
-5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>`. If it fails, the previous engine is untouched.
+5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>` and increments the policy generation. Active L7 keep-alive tunnels close before forwarding another request after they observe the new generation. If reload fails, the previous engine and generation are untouched.
 6. Reports success or failure back to the server via `ReportPolicyStatus`.
 
 See `crates/openshell-sandbox/src/grpc_client.rs` -- `CachedOpenShellClient`.
@@ -469,12 +469,17 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `host`         | `string`   | _(required)_    | Hostname or glob pattern to match (case-insensitive). Supports wildcards (`*.example.com`). Optional when `allowed_ips` is set (see [Hostless Endpoints](#hostless-endpoints-allowed_ips-without-host)). See [Host Wildcards](#host-wildcards). |
 | `port`         | `integer`  | _(required)_    | TCP port to match. Mutually exclusive with `ports` — if both are set, `ports` takes precedence. See [Multi-Port Endpoints](#multi-port-endpoints). |
 | `ports`        | `integer[]`| `[]`            | Multiple TCP ports to match. When non-empty, the endpoint covers all listed ports. Backwards compatible with `port`. See [Multi-Port Endpoints](#multi-port-endpoints). |
+| `path`         | `string`   | `""`            | Optional HTTP path glob for L7 endpoint selection when multiple protocols share a host:port, such as `/repos/**` and `/graphql`. Empty matches all paths. |
 | `protocol`     | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
 | `tls`          | `string`   | `""` (auto)      | TLS handling mode. Absent or empty: auto-detect and terminate TLS if detected. `"skip"`: bypass TLS detection entirely. `"terminate"` and `"passthrough"` are deprecated (treated as auto). See [Behavioral Trigger: TLS Handling](#behavioral-trigger-tls-handling). |
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
 | `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. Entries overlapping always-blocked ranges (loopback, link-local, unspecified) are rejected at load time. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips). |
+| `allow_encoded_slash` | `bool` | `false` | Preserves `%2F` inside L7 request path segments instead of rejecting the request. Required for endpoints such as npm scoped packages. |
+| `persisted_queries` | `string` | `"deny"` | GraphQL hash-only/saved-query behavior. Use `"allow_registered"` only with `graphql_persisted_queries`. |
+| `graphql_persisted_queries` | `map` | `{}` | Trusted GraphQL persisted-query registry keyed by hash or service-specific ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
+| `graphql_max_body_bytes` | `integer` | `65536` | Maximum GraphQL request body size buffered for inspection. Larger GraphQL bodies are rejected before policy evaluation. |
 
 #### `NetworkBinary`
 
@@ -506,6 +511,13 @@ rules:
       query:
         labels:
           any: ["bug*", "p1*"]
+  - allow:
+      operation_type: query
+      fields: [viewer, repository]
+  - allow:
+      operation_type: mutation
+      operation_name: Issue*
+      fields: [createIssue]
 ```
 
 #### `L7Allow`
@@ -516,18 +528,23 @@ rules:
 | `path`    | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter.                                   |
 | `command` | `string` | SQL command: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `*` (any). Case-insensitive matching. For `protocol: sql` endpoints. |
 | `query`   | `map`    | Optional REST query rules keyed by decoded query param name. Value is either a glob string (for example, `tag: "foo-*"`) or `{ any: ["foo-*", "bar-*"] }`. |
+| `operation_type` | `string` | GraphQL operation type: `query`, `mutation`, `subscription`, or `*`. Required for `protocol: graphql` allow rules. |
+| `operation_name` | `string` | Optional GraphQL operation-name glob. Omit to match any operation name. |
+| `fields` | `string[]` | Optional GraphQL root-field globs. For allow rules, every selected root field must match one configured glob. For deny rules, any matching root field blocks the request. |
 
-Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. Query matching is case-sensitive and evaluates decoded values; when duplicate keys are present in the request, every value for that key must match the configured matcher. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`, `query_params_match()`.
+Method, command, and GraphQL operation type fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. Query matching is case-sensitive and evaluates decoded values; when duplicate keys are present in the request, every value for that key must match the configured matcher. GraphQL field and operation-name matching also uses glob patterns. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`, `query_params_match()`, and `graphql_*`.
+
+GraphQL inspection supports `GET` and `POST` GraphQL-over-HTTP envelopes, JSON batches, named-operation selection, fragments at the operation root, Apollo persisted-query hashes, and service-specific saved-query IDs (`id`, `documentId`, or `queryId`). Hash-only or saved-query-only requests have no parseable document, so they are denied unless `persisted_queries: allow_registered` is set and the hash or ID appears in `graphql_persisted_queries`. If a batch contains any denied, malformed, or unregistered operation, the whole request is denied.
 
 #### Access Presets
 
 The `access` field provides shorthand for common rule sets. During preprocessing, presets are expanded into explicit `rules` arrays before Rego evaluation.
 
-| Preset       | Expands To                                                         | Description                              |
-| ------------ | ------------------------------------------------------------------ | ---------------------------------------- |
-| `read-only`  | `GET/**`, `HEAD/**`, `OPTIONS/**`                                  | Safe read-only HTTP methods on all paths |
-| `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | Read and write but not delete            |
-| `full`       | `*/**`                                                             | All methods, all paths                   |
+| Preset       | REST expansion                                                     | GraphQL expansion              | Description                              |
+| ------------ | ------------------------------------------------------------------ | ------------------------------ | ---------------------------------------- |
+| `read-only`  | `GET/**`, `HEAD/**`, `OPTIONS/**`                                  | `operation_type: query`        | Safe read-only access                    |
+| `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | `query`, `mutation`            | Read and write but not delete for REST   |
+| `full`       | `*/**`                                                             | `operation_type: "*"`          | All supported actions                    |
 
 See `crates/openshell-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
@@ -664,7 +681,7 @@ network_policies:
 
 Inference routing to `inference.local` is handled by the proxy's `InferenceContext`, not by the OPA policy engine or an `inference` block in the policy YAML. The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests (e.g., `POST /v1/chat/completions`, `POST /v1/messages`) through the sandbox-local `openshell-router`. See [Inference Routing](inference-routing.md) for details on route configuration and the router architecture.
 
-The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (cluster mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
+The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (gateway mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
 
 ---
 
@@ -718,11 +735,16 @@ flowchart LR
 | -------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `protocol` absent or empty | **L4 (transport)**               | The proxy performs a raw `copy_bidirectional` after the CONNECT handshake. No application-layer inspection occurs. Only the host:port and binary identity are checked.   |
 | `protocol: rest`           | **L7 (application)**             | The proxy parses each HTTP/1.1 request within the tunnel, evaluates method+path against the endpoint's `rules`, and either forwards or denies each request individually. |
+| `protocol: graphql`        | **L7 (application)**             | The proxy parses GraphQL-over-HTTP requests, classifies operation type, operation name, root fields, and persisted-query identifiers, then evaluates GraphQL allow and deny rules. |
 | `protocol: sql`            | **L7 (application, audit-only)** | Reserved for SQL protocol inspection. Currently falls through to passthrough with a warning. `enforcement: enforce` is rejected at validation time for SQL endpoints.    |
 
-This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` activates per-request HTTP parsing and policy evaluation inside the proxy.
+This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` or `protocol: graphql` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
-**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.openshell.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_route_snapshot()` which evaluates the Rego rule `data.openshell.sandbox._matching_endpoint_configs` and records the policy generation. If one or more endpoint `protocol` configs are returned, the proxy enters path-aware L7 route selection instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+
+For L7-inspected CONNECT tunnels, the proxy binds endpoint config and the per-tunnel policy engine clone to the policy generation observed at tunnel setup. If a live policy reload advances the generation, the relay closes the existing keep-alive tunnel before forwarding another request. HTTP passthrough tunnels without endpoint `protocol` use the same generation guard for parsed requests even though they do not evaluate L7 OPA rules. Clients should reconnect so the next request is evaluated under the current policy.
+
+Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes endpoints with `tls: skip`, non-HTTP CONNECT payloads, SQL audit fallback passthrough, HTTP upgrades after `101 Switching Protocols`, and already-forwarded streaming response bodies such as SSE. A policy reload applies to the next connection or next parsed HTTP request; it does not terminate raw bytes already relayed outside the HTTP request parser.
 
 **Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
@@ -757,9 +779,9 @@ If any condition fails, the proxy returns `403 Forbidden`.
 5. Resolves DNS and validates all IPs are private and within `allowed_ips`
 6. Connects to upstream
 7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
-8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
+8. Relays the rewritten request and response through the shared guarded HTTP relay. This reuses the same request body framing, CL/TE rejection, credential rewrite fail-closed behavior, unsolicited `101` blocking, and policy-generation checks as CONNECT L7 HTTP.
 
-**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. When an endpoint has L7 rules configured, the forward proxy evaluates the single request's method and path against L7 policy before forwarding.
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. The request is bound to the policy generation used for the L4 allow decision and is checked again before upstream connect and request forwarding. When an endpoint has L7 rules configured, the forward proxy also evaluates the single request's method and path against L7 policy before forwarding.
 
 **Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 
@@ -784,7 +806,7 @@ flowchart TD
     K -- No --> L["403 Forbidden"]
     K -- Yes --> M["TCP connect to upstream"]
     M --> N["Rewrite request to origin-form<br/>Add Via + Connection: close"]
-    N --> O["Forward request + copy_bidirectional"]
+    N --> O["Guarded HTTP relay"]
 ```
 
 #### Example: Forward Proxy Policy
@@ -835,7 +857,7 @@ TLS termination is automatic. The proxy peeks the first bytes of every CONNECT t
 
 **Certificate caching**: Per-hostname leaf certificates are cached (up to 256 entries, then the entire cache is cleared). See `crates/openshell-sandbox/src/l7/tls.rs` -- `CertCache`.
 
-**Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. This means credential injection works on all HTTPS endpoints automatically.
+**Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. The relay still closes parsed keep-alive HTTP tunnels after policy generation changes before forwarding another request. This means credential injection works on all HTTPS endpoints automatically.
 
 **Validation warnings**:
 
@@ -971,9 +993,11 @@ sequenceDiagram
     OPA-->>Proxy: allowed=true, matched_policy="api_policy"
     Proxy-->>Client: 200 Connection Established
 
-    Note over Proxy: Query L7 config for matched endpoint
-    Proxy->>OPA: query_endpoint_config(host, port, binary)
-    OPA-->>Proxy: {protocol: rest, enforcement: enforce}
+    Note over Proxy: Query L7 config and generation for matched endpoint
+    Proxy->>OPA: query_endpoint_config_with_generation(host, port, binary)
+    OPA-->>Proxy: {protocol: rest, enforcement: enforce}, generation=N
+    Proxy->>OPA: clone_engine_for_tunnel(generation=N)
+    OPA-->>Proxy: generation-bound tunnel evaluator
 
     Note over Proxy: Auto-detect TLS (peek first bytes)
     Note over Proxy: TLS ClientHello detected → terminate
@@ -987,9 +1011,12 @@ sequenceDiagram
 
     loop Per HTTP request in tunnel
         Client->>Proxy: GET /repos/myorg/foo HTTP/1.1
+        Note over Proxy: Close if policy generation changed
         Note over Proxy: Parse HTTP request line + headers
+        Note over Proxy: Close if policy generation changed
         Proxy->>OPA: allow_request(method=GET, path=/repos/myorg/foo)
         OPA-->>Proxy: allowed=true
+        Note over Proxy: Close if policy generation changed
         Proxy->>Upstream: GET /repos/myorg/foo HTTP/1.1
         Upstream-->>Proxy: 200 OK (response body)
         Proxy-->>Client: 200 OK (response body)
@@ -1462,14 +1489,14 @@ Evaluated on every CONNECT request and every forward proxy request. The same OPA
 | `network_action`          | Same input                                                                                                        | `"allow"` if endpoint + binary matched, `"deny"` otherwise                                    |
 | `deny_reason`             | Same input                                                                                                        | Human-readable string explaining why access was denied                                        |
 | `matched_network_policy`  | Same input                                                                                                        | Name of the matched policy (for audit logging)                                                |
-| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol` or `allowed_ips` field) |
+| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol`, `allowed_ips`, or explicit TLS config) |
 
 ### L7 Rules (per-request within tunnel)
 
-| Rule                  | Signature                                                                       | Returns                                                        |
-| --------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `allow_request`       | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path` | `true` if the request matches any rule in the matched endpoint |
-| `request_deny_reason` | Same input                                                                      | Human-readable deny message                                    |
+| Rule                  | Signature                                                                                                  | Returns                                                        |
+| --------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `allow_request`       | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path`, optional `request.graphql` | `true` if the request matches the matched endpoint's L7 rules |
+| `request_deny_reason` | Same input                                                                                                 | Human-readable deny message                                    |
 
 See `sandbox-policy.rego` for the full Rego implementation.
 

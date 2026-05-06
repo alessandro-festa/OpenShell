@@ -11,7 +11,10 @@ use crate::policy::{FilesystemPolicy, LandlockCompatibility, LandlockPolicy, Pro
 use miette::Result;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
@@ -64,6 +67,68 @@ pub struct SandboxConfig {
 /// (one eval per CONNECT request).
 pub struct OpaEngine {
     engine: Mutex<regorus::Engine>,
+    generation: Arc<AtomicU64>,
+}
+
+/// Generation guard captured when an HTTP tunnel or request path starts.
+#[derive(Clone)]
+pub struct PolicyGenerationGuard {
+    captured_generation: u64,
+    current_generation: Arc<AtomicU64>,
+}
+
+impl PolicyGenerationGuard {
+    pub fn captured_generation(&self) -> u64 {
+        self.captured_generation
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.current_generation.load(Ordering::Acquire)
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.current_generation() != self.captured_generation
+    }
+
+    pub fn ensure_current(&self) -> Result<()> {
+        if self.is_stale() {
+            return Err(miette::miette!(
+                "policy generation is stale [captured_generation:{} current_generation:{}]",
+                self.captured_generation(),
+                self.current_generation(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Per-tunnel L7 policy evaluator bound to the engine generation captured when
+/// the tunnel was established.
+pub struct TunnelPolicyEngine {
+    engine: Mutex<regorus::Engine>,
+    generation_guard: PolicyGenerationGuard,
+}
+
+impl TunnelPolicyEngine {
+    pub fn captured_generation(&self) -> u64 {
+        self.generation_guard.captured_generation()
+    }
+
+    pub fn current_generation(&self) -> u64 {
+        self.generation_guard.current_generation()
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.generation_guard.is_stale()
+    }
+
+    pub fn generation_guard(&self) -> &PolicyGenerationGuard {
+        &self.generation_guard
+    }
+
+    pub(crate) fn engine(&self) -> &Mutex<regorus::Engine> {
+        &self.engine
+    }
 }
 
 impl OpaEngine {
@@ -84,6 +149,7 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -101,6 +167,7 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -137,7 +204,7 @@ impl OpaEngine {
                     .severity(openshell_ocsf::SeverityId::Medium)
                     .status(openshell_ocsf::StatusId::Success)
                     .state(openshell_ocsf::StateId::Enabled, "validated")
-                    .unmapped("warning", serde_json::json!(w.to_string()))
+                    .unmapped("warning", serde_json::json!(w.clone()))
                     .message(format!("L7 policy validation warning: {w}"))
                     .build()
             );
@@ -162,6 +229,7 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
+            generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -233,6 +301,14 @@ impl OpaEngine {
     /// Uses the OPA `network_action` rule which returns one of:
     /// `"allow"` or `"deny"`.
     pub fn evaluate_network_action(&self, input: &NetworkInput) -> Result<NetworkAction> {
+        Ok(self.evaluate_network_action_with_generation(input)?.0)
+    }
+
+    /// Evaluate network action and return the policy generation used for the evaluation.
+    pub fn evaluate_network_action_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(NetworkAction, u64)> {
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -259,6 +335,7 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
@@ -278,15 +355,14 @@ impl OpaEngine {
             Some(value_to_string(&matched))
         };
 
-        match action_str.as_str() {
-            "allow" => Ok(NetworkAction::Allow { matched_policy }),
-            _ => {
-                let reason_val = engine
-                    .eval_rule("data.openshell.sandbox.deny_reason".into())
-                    .map_err(|e| miette::miette!("{e}"))?;
-                let reason = value_to_string(&reason_val);
-                Ok(NetworkAction::Deny { reason })
-            }
+        if action_str == "allow" {
+            Ok((NetworkAction::Allow { matched_policy }, generation))
+        } else {
+            let reason_val = engine
+                .eval_rule("data.openshell.sandbox.deny_reason".into())
+                .map_err(|e| miette::miette!("{e}"))?;
+            let reason = value_to_string(&reason_val);
+            Ok((NetworkAction::Deny { reason }, generation))
         }
     }
 
@@ -307,6 +383,7 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
     }
 
@@ -341,7 +418,27 @@ impl OpaEngine {
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
         *engine = new_engine;
+        self.generation.fetch_add(1, Ordering::AcqRel);
         Ok(())
+    }
+
+    /// Current policy generation. Successful reloads increment this value.
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Return a guard for a previously captured policy generation.
+    pub fn generation_guard(&self, expected_generation: u64) -> Result<PolicyGenerationGuard> {
+        let generation = self.current_generation();
+        if generation != expected_generation {
+            return Err(miette::miette!(
+                "policy changed before HTTP relay started [expected_generation:{expected_generation} current_generation:{generation}]"
+            ));
+        }
+        Ok(PolicyGenerationGuard {
+            captured_generation: generation,
+            current_generation: Arc::clone(&self.generation),
+        })
     }
 
     /// Query static sandbox configuration from the OPA data module.
@@ -386,6 +483,23 @@ impl OpaEngine {
     /// to get the full endpoint object for the matched policy. Returns the raw
     /// `regorus::Value` which can be parsed by `l7::parse_l7_config()`.
     pub fn query_endpoint_config(&self, input: &NetworkInput) -> Result<Option<regorus::Value>> {
+        Ok(self.query_endpoint_config_with_generation(input)?.0)
+    }
+
+    /// Query L7 endpoint config and return the policy generation used for the query.
+    pub fn query_endpoint_config_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(Option<regorus::Value>, u64)> {
+        let (configs, generation) = self.query_endpoint_configs_with_generation(input)?;
+        Ok((configs.into_iter().next(), generation))
+    }
+
+    /// Query all matching endpoint configs and return the policy generation used for the query.
+    pub fn query_endpoint_configs_with_generation(
+        &self,
+        input: &NetworkInput,
+    ) -> Result<(Vec<regorus::Value>, u64)> {
         let ancestor_strs: Vec<String> = input
             .ancestors
             .iter()
@@ -412,19 +526,20 @@ impl OpaEngine {
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        let generation = self.current_generation();
 
         engine
             .set_input_json(&input_json.to_string())
             .map_err(|e| miette::miette!("{e}"))?;
 
         let val = engine
-            .eval_rule("data.openshell.sandbox.matched_endpoint_config".into())
+            .eval_rule("data.openshell.sandbox._matching_endpoint_configs".into())
             .map_err(|e| miette::miette!("{e}"))?;
 
-        if val == regorus::Value::Undefined {
-            Ok(None)
-        } else {
-            Ok(Some(val))
+        match val {
+            regorus::Value::Undefined => Ok((Vec::new(), generation)),
+            regorus::Value::Array(values) => Ok((values.to_vec(), generation)),
+            other => Ok((vec![other], generation)),
         }
     }
 
@@ -435,10 +550,10 @@ impl OpaEngine {
     /// match. This is used by the proxy to decide between full SSRF blocking
     /// and allowlist-based IP validation.
     pub fn query_allowed_ips(&self, input: &NetworkInput) -> Result<Vec<String>> {
-        match self.query_endpoint_config(input)? {
-            Some(val) => Ok(get_str_array(&val, "allowed_ips")),
-            None => Ok(vec![]),
-        }
+        Ok(self
+            .query_endpoint_config(input)?
+            .map(|val| get_str_array(&val, "allowed_ips"))
+            .unwrap_or_default())
     }
 
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
@@ -446,12 +561,24 @@ impl OpaEngine {
     /// With the `arc` feature enabled, this shares compiled policy via Arc
     /// and only duplicates interpreter state (~microseconds). The cloned
     /// engine can be used without Mutex contention.
-    pub fn clone_engine_for_tunnel(&self) -> Result<regorus::Engine> {
+    pub fn clone_engine_for_tunnel(&self, expected_generation: u64) -> Result<TunnelPolicyEngine> {
         let engine = self
             .engine
             .lock()
             .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
-        Ok(engine.clone())
+        let generation = self.current_generation();
+        if generation != expected_generation {
+            return Err(miette::miette!(
+                "policy changed before L7 tunnel started [expected_generation:{expected_generation} current_generation:{generation}]"
+            ));
+        }
+        Ok(TunnelPolicyEngine {
+            engine: Mutex::new(engine.clone()),
+            generation_guard: PolicyGenerationGuard {
+                captured_generation: generation,
+                current_generation: Arc::clone(&self.generation),
+            },
+        })
     }
 }
 
@@ -557,7 +684,7 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
                 .severity(openshell_ocsf::SeverityId::Medium)
                 .status(openshell_ocsf::StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "validated")
-                .unmapped("warning", serde_json::json!(w.to_string()))
+                .unmapped("warning", serde_json::json!(w.clone()))
                 .message(format!("L7 policy validation warning: {w}"))
                 .build()
         );
@@ -594,9 +721,8 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
         };
 
         for ep in endpoints.iter_mut() {
-            let ep_obj = match ep.as_object_mut() {
-                Some(obj) => obj,
-                None => continue,
+            let Some(ep_obj) = ep.as_object_mut() else {
+                continue;
             };
 
             // If "ports" already exists and is non-empty, keep it.
@@ -637,10 +763,12 @@ fn normalize_endpoint_ports(data: &mut serde_json::Value) {
 /// - Path is not a symlink
 /// - Resolution fails (binary doesn't exist in container)
 /// - Resolved path equals the original
+///
 /// Normalize a path by resolving `.` and `..` components without touching
 /// the filesystem. Only works correctly for absolute paths.
-fn normalize_path(path: &std::path::Path) -> std::path::PathBuf {
-    let mut result = std::path::PathBuf::new();
+#[cfg(any(target_os = "linux", test))]
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
     for component in path.components() {
         match component {
             std::path::Component::ParentDir => {
@@ -664,7 +792,7 @@ fn resolve_binary_in_container(policy_path: &str, entrypoint_pid: u32) -> Option
     // /proc/<pid>/root itself (a kernel pseudo-symlink to /) which
     // strips the prefix we need. read_link only reads the target of
     // the specified symlink, keeping us in the container's namespace.
-    let mut resolved = std::path::PathBuf::from(policy_path);
+    let mut resolved = PathBuf::from(policy_path);
 
     // Linux SYMLOOP_MAX is 40; stop before infinite loops
     for _ in 0..40 {
@@ -820,6 +948,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                         vec![]
                     };
                     let mut ep = serde_json::json!({"host": e.host, "ports": ports});
+                    if !e.path.is_empty() {
+                        ep["path"] = e.path.clone().into();
+                    }
                     if !e.protocol.is_empty() {
                         ep["protocol"] = e.protocol.clone().into();
                     }
@@ -842,7 +973,14 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                     "method": a.map_or("", |a| &a.method),
                                     "path": a.map_or("", |a| &a.path),
                                     "command": a.map_or("", |a| &a.command),
+                                    "operation_type": a.map_or("", |a| &a.operation_type),
+                                    "operation_name": a.map_or("", |a| &a.operation_name),
                                 });
+                                if let Some(a) = a
+                                    && !a.fields.is_empty()
+                                {
+                                    allow["fields"] = a.fields.clone().into();
+                                }
                                 let query: serde_json::Map<String, serde_json::Value> = a
                                     .map(|allow| {
                                         allow
@@ -889,6 +1027,15 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                                 if !d.command.is_empty() {
                                     deny["command"] = d.command.clone().into();
                                 }
+                                if !d.operation_type.is_empty() {
+                                    deny["operation_type"] = d.operation_type.clone().into();
+                                }
+                                if !d.operation_name.is_empty() {
+                                    deny["operation_name"] = d.operation_name.clone().into();
+                                }
+                                if !d.fields.is_empty() {
+                                    deny["fields"] = d.fields.clone().into();
+                                }
                                 let query: serde_json::Map<String, serde_json::Value> = d
                                     .query
                                     .iter()
@@ -910,6 +1057,32 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
                             })
                             .collect();
                         ep["deny_rules"] = deny_rules.into();
+                    }
+                    if e.allow_encoded_slash {
+                        ep["allow_encoded_slash"] = true.into();
+                    }
+                    if !e.persisted_queries.is_empty() {
+                        ep["persisted_queries"] = e.persisted_queries.clone().into();
+                    }
+                    if !e.graphql_persisted_queries.is_empty() {
+                        let persisted: serde_json::Map<String, serde_json::Value> = e
+                            .graphql_persisted_queries
+                            .iter()
+                            .map(|(key, op)| {
+                                (
+                                    key.clone(),
+                                    serde_json::json!({
+                                        "operation_type": op.operation_type,
+                                        "operation_name": op.operation_name,
+                                        "fields": op.fields,
+                                    }),
+                                )
+                            })
+                            .collect();
+                        ep["graphql_persisted_queries"] = persisted.into();
+                    }
+                    if e.graphql_max_body_bytes > 0 {
+                        ep["graphql_max_body_bytes"] = e.graphql_max_body_bytes.into();
                     }
                     ep
                 })
@@ -946,6 +1119,13 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy, entrypoint_pid: u32) -> St
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::match_wildcard_for_single_variants,
+    reason = "Test code: test fixtures and panic-on-unexpected matches are idiomatic in tests."
+)]
 mod tests {
     use super::*;
 
@@ -1595,6 +1775,42 @@ network_policies:
                   any: ["foo-*", "bar-*"]
     binaries:
       - { path: /usr/bin/curl }
+  graphql_api:
+    name: graphql_api
+    endpoints:
+      - host: api.graphql.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue, deleteRepository]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - { path: /usr/bin/curl }
+  graphql_readonly:
+    name: graphql_readonly
+    endpoints:
+      - host: gql.readonly.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
   l4_only:
     name: l4_only
     endpoints:
@@ -1638,6 +1854,45 @@ process:
                 "method": method,
                 "path": path,
                 "query_params": query_params
+            }
+        })
+    }
+
+    fn l7_graphql_input(host: &str, operations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": 443 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "POST",
+                "path": "/graphql",
+                "query_params": {},
+                "graphql": {
+                    "operations": operations
+                }
+            }
+        })
+    }
+
+    fn l7_graphql_error_input(host: &str, error: &str) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": 443 },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "POST",
+                "path": "/graphql",
+                "query_params": {},
+                "graphql": {
+                    "operations": [],
+                    "error": error
+                }
             }
         })
     }
@@ -1724,6 +1979,215 @@ process:
                 "{method} should be allowed with full preset"
             );
         }
+    }
+
+    #[test]
+    fn l7_graphql_query_allowed_by_field_rule() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "operation_name": "RepoLookup",
+                "fields": ["repository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_unlisted_field_denied() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["viewer", "adminAuditLog"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_batch_denied_if_any_operation_unallowed() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([
+                {
+                    "operation_type": "query",
+                    "fields": ["viewer"],
+                    "persisted_query": false
+                },
+                {
+                    "operation_type": "mutation",
+                    "operation_name": "DeleteRepo",
+                    "fields": ["deleteRepository"],
+                    "persisted_query": false
+                }
+            ]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_deny_rule_takes_precedence() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "operation_name": "IssueDelete",
+                "fields": ["deleteRepository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_registered_hash_only_query_allowed() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "",
+                "operation_name": "Viewer",
+                "fields": [],
+                "persisted_query": true,
+                "persisted_query_hash": "abc123"
+            }]),
+        );
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_unregistered_hash_only_query_denied() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "",
+                "operation_name": "Viewer",
+                "fields": [],
+                "persisted_query": true,
+                "persisted_query_hash": "missing"
+            }]),
+        );
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_unregistered_hash_only_query_has_deny_reason() {
+        let engine = l7_engine();
+        let input = l7_graphql_input(
+            "api.graphql.com",
+            serde_json::json!([{
+                "operation_type": "",
+                "operation_name": "Viewer",
+                "fields": [],
+                "persisted_query": true,
+                "persisted_query_hash": "missing"
+            }]),
+        );
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.request_deny_reason".into())
+            .unwrap();
+        assert_eq!(
+            val,
+            regorus::Value::String("GraphQL persisted query is not registered".into())
+        );
+    }
+
+    #[test]
+    fn l7_graphql_parse_error_denied() {
+        let engine = l7_engine();
+        let input = l7_graphql_error_input("api.graphql.com", "GraphQL document parse error");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_graphql_readonly_access_allows_query_and_denies_mutation() {
+        let engine = l7_engine();
+        let query = l7_graphql_input(
+            "gql.readonly.com",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["viewer"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &query));
+
+        let mutation = l7_graphql_input(
+            "gql.readonly.com",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "fields": ["createIssue"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(!eval_l7(&engine, &mutation));
+    }
+
+    #[test]
+    fn l7_endpoint_path_scopes_rest_and_graphql_on_same_host() {
+        let data = r#"
+network_policies:
+  mixed_api:
+    name: mixed_api
+    endpoints:
+      - host: api.github.test
+        port: 443
+        path: "/repos/**"
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: "*"
+              path: "/**"
+      - host: api.github.test
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        enforcement: enforce
+        rules:
+          - allow:
+              operation_type: query
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+
+        let rest_write = l7_input("api.github.test", 443, "POST", "/repos/org/repo/issues");
+        assert!(eval_l7(&engine, &rest_write));
+
+        let graphql_query = l7_graphql_input(
+            "api.github.test",
+            serde_json::json!([{
+                "operation_type": "query",
+                "fields": ["viewer"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(eval_l7(&engine, &graphql_query));
+
+        let graphql_mutation = l7_graphql_input(
+            "api.github.test",
+            serde_json::json!([{
+                "operation_type": "mutation",
+                "fields": ["deleteRepository"],
+                "persisted_query": false
+            }]),
+        );
+        assert!(
+            !eval_l7(&engine, &graphql_mutation),
+            "REST rules on the same host must not allow a GraphQL mutation"
+        );
     }
 
     #[test]
@@ -1827,6 +2291,9 @@ process:
                             path: "/download".to_string(),
                             command: String::new(),
                             query,
+                            operation_type: String::new(),
+                            operation_name: String::new(),
+                            fields: Vec::new(),
                         }),
                     }],
                     ..Default::default()
@@ -1940,6 +2407,63 @@ process:
     }
 
     #[test]
+    fn l7_endpoint_config_preserves_proto_allow_encoded_slash() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "npm".to_string(),
+            NetworkPolicyRule {
+                name: "npm".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "registry.npmjs.org".to_string(),
+                    port: 443,
+                    protocol: "rest".to_string(),
+                    enforcement: "enforce".to_string(),
+                    access: "read-only".to_string(),
+                    allow_encoded_slash: true,
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/node".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+
+        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
+        let input = NetworkInput {
+            host: "registry.npmjs.org".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let config = engine
+            .query_endpoint_config(&input)
+            .unwrap()
+            .expect("endpoint config");
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert!(l7.allow_encoded_slash);
+    }
+
+    #[test]
     fn l7_endpoint_config_none_for_l4_only() {
         let engine = l7_engine();
         let input = NetworkInput {
@@ -1960,15 +2484,96 @@ process:
     #[test]
     fn l7_clone_engine_for_tunnel() {
         let engine = l7_engine();
-        let cloned = engine.clone_engine_for_tunnel().unwrap();
+        let cloned = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
         // Verify the cloned engine can evaluate
         let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
-        let mut eng = cloned;
+        let mut eng = cloned.engine().lock().unwrap();
         eng.set_input_json(&input_json.to_string()).unwrap();
         let val = eng
             .eval_rule("data.openshell.sandbox.allow_request".into())
             .unwrap();
         assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn policy_generation_starts_at_zero_and_increments_on_successful_reload() {
+        let engine = l7_engine();
+        assert_eq!(engine.current_generation(), 0);
+
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+
+        assert_eq!(engine.current_generation(), 1);
+    }
+
+    #[test]
+    fn policy_generation_does_not_increment_on_failed_reload() {
+        let engine = l7_engine();
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+        assert_eq!(engine.current_generation(), 1);
+
+        let invalid_l7_data = r#"
+network_policies:
+  bad_api:
+    name: bad_api
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        protocol: invalid-protocol
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        assert!(engine.reload(TEST_POLICY, invalid_l7_data).is_err());
+        assert_eq!(engine.current_generation(), 1);
+
+        let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        let cloned = engine
+            .clone_engine_for_tunnel(engine.current_generation())
+            .unwrap();
+        let mut eng = cloned.engine().lock().unwrap();
+        eng.set_input_json(&input_json.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.openshell.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(val, regorus::Value::from(true));
+    }
+
+    #[test]
+    fn endpoint_config_generation_matches_query_generation() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+
+        let (config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        assert!(config.is_some());
+        assert_eq!(generation, engine.current_generation());
+
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+
+        let (config, generation) = engine
+            .query_endpoint_config_with_generation(&input)
+            .unwrap();
+        assert!(config.is_some());
+        assert_eq!(generation, engine.current_generation());
+        assert_eq!(generation, 1);
+    }
+
+    #[test]
+    fn tunnel_clone_rejects_stale_generation() {
+        let engine = l7_engine();
+        let captured_generation = engine.current_generation();
+        engine.reload(TEST_POLICY, L7_TEST_DATA).unwrap();
+
+        assert!(engine.clone_engine_for_tunnel(captured_generation).is_err());
     }
 
     // ========================================================================
@@ -3673,9 +4278,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     fn procfs_root_accessible() -> bool {
         use std::os::unix::fs::symlink;
-        let dir = match tempfile::tempdir() {
-            Ok(d) => d,
-            Err(_) => return false,
+        let Ok(dir) = tempfile::tempdir() else {
+            return false;
         };
         let target = dir.path().join("probe_target");
         let link = dir.path().join("probe_link");
@@ -3694,6 +4298,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_with_real_symlink() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3701,7 +4307,6 @@ network_policies:
 
         // Create a real symlink in a temp directory and verify resolution
         // works through /proc/self/root (which maps to / on the host)
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("python3.11");
         let link = dir.path().join("python3");
@@ -3730,13 +4335,14 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_non_symlink_returns_none() {
+        use std::io::Write;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
         // A regular file should return None (no expansion needed)
-        use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"regular file").unwrap();
         tmp.flush().unwrap();
@@ -3754,13 +4360,14 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn resolve_binary_multi_level_symlink() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
         }
 
         // Test multi-level symlink resolution: python3 -> python3.11 -> cpython3.11
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let final_target = dir.path().join("cpython3.11");
         let mid_link = dir.path().join("python3.11");
@@ -3785,6 +4392,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn from_proto_with_pid_expands_symlinks_in_container() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3792,7 +4401,6 @@ network_policies:
 
         // End-to-end test: create a symlink, build engine with our PID,
         // verify the resolved path is allowed
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("node22");
         let link = dir.path().join("node");
@@ -3861,6 +4469,8 @@ network_policies:
     #[cfg(target_os = "linux")]
     #[test]
     fn reload_from_proto_with_pid_resolves_symlinks() {
+        use std::os::unix::fs::symlink;
+
         if !procfs_root_accessible() {
             eprintln!("Skipping: /proc/<pid>/root/ not accessible in this environment");
             return;
@@ -3868,7 +4478,6 @@ network_policies:
 
         // Test hot-reload path: initial engine at pid=0, then reload with
         // real PID to trigger symlink resolution
-        use std::os::unix::fs::symlink;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("python3.11");
         let link = dir.path().join("python3");

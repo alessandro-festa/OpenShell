@@ -66,7 +66,7 @@ graph TD
 | Protocol mux | `crates/openshell-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody`, HTTP/2 adaptive-window tuning |
 | gRPC: OpenShell | `crates/openshell-server/src/grpc/mod.rs` | `OpenShellService` trait impl -- dispatches to per-concern handlers |
 | gRPC: Sandbox/Exec | `crates/openshell-server/src/grpc/sandbox.rs` | Sandbox CRUD, `ExecSandbox`, SSH session handlers, relay-backed exec proxy |
-| gRPC: Inference | `crates/openshell-server/src/inference.rs` | `InferenceService` -- cluster inference config and sandbox bundle delivery |
+| gRPC: Inference | `crates/openshell-server/src/inference.rs` | `InferenceService` -- gateway inference config and sandbox bundle delivery |
 | Supervisor sessions | `crates/openshell-server/src/supervisor_session.rs` | `SupervisorSessionRegistry`, `handle_connect_supervisor`, `handle_relay_stream`, reaper |
 | HTTP | `crates/openshell-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
 | Browser auth | `crates/openshell-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
@@ -107,22 +107,25 @@ The gateway boots in `cli::run_cli` (`crates/openshell-server/src/cli.rs`) and p
       - `docker` constructs `openshell-driver-docker` in-process and manages local containers labeled with the configured sandbox namespace.
       - `vm` spawns the standalone `openshell-driver-vm` binary as a local compute-driver process, resolves it from `--driver-dir`, conventional libexec install paths, or a sibling of the gateway binary, connects to it over a Unix domain socket, and keeps the libkrun/rootfs runtime out of the gateway binary.
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers), including a fresh `SupervisorSessionRegistry`.
-   4. **Spawn background tasks**:
+   4. Resume persisted sandboxes that were stopped during the previous gateway shutdown.
+   5. **Spawn background tasks**:
       - `ComputeRuntime::spawn_watchers` -- consumes the compute-driver watch stream, republishes platform events, and runs a periodic `ListSandboxes` snapshot reconcile.
       - `ssh_tunnel::spawn_session_reaper` -- sweeps expired or revoked SSH session tokens from the store hourly.
       - `supervisor_session::spawn_relay_reaper` -- sweeps orphaned pending relay channels every 30 seconds.
-   5. Create `MultiplexService`.
-   6. Bind `TcpListener` on `config.bind_address`.
-   7. Optionally create `TlsAcceptor` from cert/key files.
-   8. Enter the accept loop: for each connection, spawn a tokio task that optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
+   6. Create `MultiplexService`.
+   7. Bind the primary gateway listener and any compute-driver requested listeners. Docker requests the Docker bridge gateway address with the normal gateway port, so sandbox containers can call back over the bridge without joining the host network.
+   8. Bind optional health and metrics listeners.
+   9. Optionally create `TlsAcceptor` from cert/key files.
+   10. Spawn a task per gateway listener. Each accepted connection optionally performs a TLS handshake, then calls `MultiplexService::serve()`.
 
 ## Configuration
 
-All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is required. The `--ssh-handshake-secret` flag is required for non-Docker drivers; Docker sandboxes do not receive a handshake secret.
+All configuration is via CLI flags with environment variable fallbacks. The `--db-url` flag is required.
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
+| `--bind-address` | `OPENSHELL_BIND_ADDRESS` | `127.0.0.1` | IP address for gateway, health, and metrics listeners. Container deployments pass `0.0.0.0` explicitly. |
+| `--port` | `OPENSHELL_SERVER_PORT` | `8080` | TCP listen port |
 | `--log-level` | `OPENSHELL_LOG_LEVEL` | `info` | Tracing log level filter |
 | `--tls-cert` | `OPENSHELL_TLS_CERT` | None | Path to PEM certificate file |
 | `--tls-key` | `OPENSHELL_TLS_KEY` | None | Path to PEM private key file |
@@ -133,10 +136,11 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--db-url` | `OPENSHELL_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/openshell/openshell.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
-| `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for supervisor callbacks) |
+| `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from sandbox workloads for supervisor callbacks |
 | `--drivers` | `OPENSHELL_DRIVERS` | `kubernetes` | Compute backend to use. Current options are `kubernetes`, `docker`, and `vm`. |
-| `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, and runtime state |
-| `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
+| `--docker-network-name` | `OPENSHELL_DOCKER_NETWORK_NAME` | `openshell-docker` | Docker bridge network that local Docker sandboxes join |
+| `--driver-dir` | `OPENSHELL_DRIVER_DIR` | unset | Override directory for `openshell-driver-vm`. When unset, the gateway searches `~/.local/libexec/openshell`, `/usr/libexec/openshell`, `/usr/local/libexec/openshell`, `/usr/local/libexec`, then a sibling binary. |
+| `--vm-driver-state-dir` | `OPENSHELL_VM_DRIVER_STATE_DIR` | `target/openshell-vm-driver` | Host directory for VM sandbox rootfs, console logs, runtime state, and shared image-rootfs cache |
 | `--vm-krun-log-level` | `OPENSHELL_VM_KRUN_LOG_LEVEL` | `1` | libkrun log level for VM helper processes |
 | `--vm-driver-vcpus` | `OPENSHELL_VM_DRIVER_VCPUS` | `2` | Default vCPU count for VM sandboxes |
 | `--vm-driver-mem-mib` | `OPENSHELL_VM_DRIVER_MEM_MIB` | `2048` | Default memory allocation for VM sandboxes in MiB |
@@ -211,7 +215,7 @@ When TLS is enabled (`crates/openshell-server/src/tls.rs`):
 - `--disable-tls` removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
 - Supports PKCS#1, PKCS#8, and SEC1 private key formats.
 - The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
-- Certificates are generated at cluster bootstrap time by the `openshell-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `openshell-server-tls` (server cert+key), `openshell-server-client-ca` (CA cert), and `openshell-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
+- Certificates are operator-provided in the target deployment model. Helm deployments consume three K8s secrets: `openshell-server-tls` (server cert+key), `openshell-server-client-ca` (CA cert), and `openshell-client-tls` (client cert+key+CA, shared by CLI and sandbox workloads).
 - Sandbox supervisors reuse the shared client cert to authenticate their `ConnectSupervisor` and `RelayStream` calls over the same mTLS channel.
 
 ## Supervisor Sessions
@@ -395,27 +399,27 @@ These RPCs support the sandbox-initiated policy recommendation pipeline. The san
 
 Defined in `proto/inference.proto`, implemented in `crates/openshell-server/src/inference.rs` as `InferenceService`.
 
-The gateway acts as the control plane for inference configuration. It stores a single managed cluster inference route (named `inference.local`) and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
+The gateway acts as the control plane for inference configuration. It stores a single managed gateway inference route (named `inference.local`) and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
 
-#### Cluster Inference Configuration
+#### Gateway Inference Configuration
 
-The gateway manages a single cluster-wide inference route that maps to a provider record. When set, the route stores only a `provider_name` and `model_id` reference. At bundle resolution time, the gateway looks up the referenced provider and derives the endpoint URL, API key, protocols, and provider type from it. This late-binding design means provider credential rotations are automatically reflected in the next bundle fetch without updating the route itself.
+The gateway manages a single gateway-wide inference route that maps to a provider record. When set, the route stores only a `provider_name` and `model_id` reference. At bundle resolution time, the gateway looks up the referenced provider and derives the endpoint URL, API key, protocols, and provider type from it. This late-binding design means provider credential rotations are automatically reflected in the next bundle fetch without updating the route itself.
 
 | RPC | Description |
 |-----|-------------|
-| `SetClusterInference` | Configures the cluster inference route. Validates `provider_name` and `model_id` are non-empty, verifies the named provider exists and has a supported type for inference (openai, anthropic, nvidia), validates the provider has a usable API key, then upserts the `inference.local` route record. Increments a monotonic `version` on each update. Returns the configured `provider_name`, `model_id`, and `version`. |
-| `GetClusterInference` | Returns the current cluster inference configuration (`provider_name`, `model_id`, `version`). Returns `NotFound` if no cluster inference is configured, or `FailedPrecondition` if the stored route has empty provider/model metadata. |
+| `SetClusterInference` | Configures the gateway inference route. Validates `provider_name` and `model_id` are non-empty, verifies the named provider exists and has a supported type for inference (openai, anthropic, nvidia), validates the provider has a usable API key, then upserts the `inference.local` route record. Increments a monotonic `version` on each update. Returns the configured `provider_name`, `model_id`, and `version`. |
+| `GetClusterInference` | Returns the current gateway inference configuration (`provider_name`, `model_id`, `version`). Returns `NotFound` if no gateway inference is configured, or `FailedPrecondition` if the stored route has empty provider/model metadata. |
 | `GetInferenceBundle` | Returns the resolved inference route bundle for sandbox consumption. See [Route Bundle Delivery](#route-bundle-delivery) below. |
 
 #### Route Bundle Delivery
 
-The `GetInferenceBundle` RPC resolves the managed cluster route into a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
+The `GetInferenceBundle` RPC resolves the managed gateway route into a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
 
 The trait method delegates to `resolve_inference_bundle(store)` (`crates/openshell-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
 
 The `GetInferenceBundleResponse` includes:
 
-- **`routes`** -- a list of `ResolvedRoute` messages containing base URL, model ID, API key, protocols, and provider type. Currently contains zero or one routes (the managed cluster route).
+- **`routes`** -- a list of `ResolvedRoute` messages containing base URL, model ID, API key, protocols, and provider type. Currently contains zero or one routes (the managed gateway route).
 - **`revision`** -- a hex-encoded hash computed from route contents. Sandboxes compare this value to detect when their route set has changed.
 - **`generated_at_ms`** -- epoch milliseconds when the bundle was assembled.
 
@@ -578,7 +582,7 @@ The `generate_name()` function produces random 6-character lowercase alphabetic 
 
 ### Deployment Storage
 
-The gateway runs as a Kubernetes **StatefulSet** with a `volumeClaimTemplate` that provisions a 1Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/var/openshell`. On k3s clusters this uses the built-in `local-path-provisioner` StorageClass (the cluster default). The SQLite database file at `/var/openshell/openshell.db` survives pod restarts and rescheduling.
+The gateway runs as a Kubernetes **StatefulSet** with a `volumeClaimTemplate` that provisions a 1Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/var/openshell`. The cluster's default StorageClass supplies the volume unless an operator customizes the chart. The SQLite database file at `/var/openshell/openshell.db` survives pod restarts and rescheduling.
 
 The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`.
 
@@ -607,6 +611,9 @@ The gateway reaches the sandbox exclusively through the supervisor-initiated `Co
 The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process compute backend for local standalone gateways. It creates one Docker container per sandbox, labels each container with `openshell.ai/managed-by=openshell`, `openshell.ai/sandbox-id`, `openshell.ai/sandbox-name`, and `openshell.ai/sandbox-namespace`, and bind-mounts a Linux `openshell-sandbox` supervisor binary into the container.
 
 - **Create**: Pulls or validates the sandbox image according to `sandbox_image_pull_policy`, creates a labeled container, mounts the supervisor binary and optional TLS material, and starts the container with the supervisor as entrypoint.
+- **Bridge networking**: Ensures a local Docker bridge network exists (`openshell-docker` by default) and starts every sandbox container on that network instead of using `network_mode=host`.
+- **Gateway callback routing**: On native Linux Docker, injects `host.openshell.internal` with the bridge gateway IP and reports that bridge gateway IP plus the normal gateway port to `run_server()` as an extra listener. If the primary listener already binds the wildcard address for that port, the extra address is covered and is not bound a second time. On Docker Desktop, the bridge gateway IP belongs to Docker Desktop's VM rather than the macOS/Windows host, so the driver maps `host.openshell.internal` to Docker's `host-gateway` alias and does not request an extra listener. `OPENSHELL_ENDPOINT` inside Docker sandboxes uses the configured scheme and points at `host.openshell.internal:<gateway-port>` in both cases.
+- **Environment ownership**: Merges template and spec environment first, then overwrites driver-owned supervisor variables, including `PATH`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SSH_SOCKET_PATH`, and `OPENSHELL_SANDBOX_COMMAND`. This keeps privileged supervisor setup from resolving helper binaries through a user-controlled search path.
 - **List/Get/Watch**: Reads labeled containers in the configured sandbox namespace and derives driver-native sandbox status from Docker state plus supervisor relay readiness.
 - **Stop**: Stops the matching labeled container without deleting it.
 - **Delete**: Force-removes the matching labeled container.
@@ -618,7 +625,7 @@ The Docker driver (`crates/openshell-driver-docker/src/lib.rs`) is an in-process
 
 `VmDriver` (`crates/openshell-driver-vm/src/driver.rs`) is served by the standalone `openshell-driver-vm` process. The gateway spawns that binary on demand and talks to it over the internal `openshell.compute.v1.ComputeDriver` gRPC contract via a Unix domain socket.
 
-- **Create**: The VM driver process allocates a sandbox-specific rootfs from its own embedded `rootfs.tar.zst`, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots the supervisor.
+- **Create**: The VM driver process exports the selected sandbox image from the local Docker daemon, rewrites it into a sandbox-specific guest rootfs, injects an explicitly configured guest mTLS bundle when the gateway callback endpoint is `https://`, then re-execs itself in a hidden helper mode that loads libkrun directly and boots the supervisor.
 - **Networking**: The helper starts an embedded `gvproxy`, wires it into libkrun as virtio-net, and gives the guest outbound connectivity. No inbound TCP listener is needed — the supervisor reaches the gateway over its outbound `ConnectSupervisor` stream.
 - **Gateway callback**: The guest init script configures `eth0` for gvproxy networking, seeds `/etc/hosts` so `host.openshell.internal` resolves to the gvproxy gateway IP (`192.168.127.1`), preserves gvproxy's legacy `host.containers.internal` / `host.docker.internal` DNS answers, prefers the configured `OPENSHELL_GRPC_ENDPOINT`, and falls back to those aliases or the raw gateway IP when local hostname resolution is unavailable on macOS.
 - **Guest boot**: The sandbox guest runs a minimal init script that starts `openshell-sandbox` directly as PID 1 inside the VM.
