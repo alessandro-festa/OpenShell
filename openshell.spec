@@ -2,14 +2,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 %global crate openshell
+%global openshell_cargo_version %{version}
+# Python dist-info metadata intentionally follows the RPM Version. Dev build
+# identity is represented by Release for RPM packages.
+%global openshell_python_version %{version}
 
 # Cargo/Rust builds with vendored deps do not produce debugsource listings
 # in the format redhat-rpm-config expects (especially on EPEL).
 %global debug_package %{nil}
 
+# Default container image tag for supervisor and sandbox images.
+# Overridden to 'latest' by Packit's fix-spec-file action for tagged stable
+# releases (via git describe --exact-match). PR and commit-to-main builds
+# keep the default 'dev' so they track the development image stream.
+%global image_tag dev
+
 Name:           openshell
 Version:        0.0.37
-Release:        1.20260505111703438211.rpm.100.gec0e2ce3%{?dist}
+Release:        1.20260506170246815148.rpm.dev.106.g99e94469%{?dist}
 Summary:        Safe, sandboxed runtimes for autonomous AI agents
 
 License:        Apache-2.0
@@ -42,13 +52,13 @@ BuildRequires:  pandoc
 # Python sub-package build dependencies
 BuildRequires:  python3-devel
 
-# Runtime: container runtime for gateway lifecycle (start/stop/destroy).
+# Runtime: container runtime for package-managed gateway sandboxes.
 # Podman is preferred; Docker is also supported via --container-runtime flag.
 Recommends:     podman
 
 %description
 OpenShell provides safe, sandboxed runtimes for autonomous AI agents.
-It offers a CLI for managing gateways, sandboxes, and providers with
+It offers a CLI for managing gateway registrations, sandboxes, and providers with
 policy-enforced egress routing, credential proxying, and privacy-aware
 LLM inference routing.
 
@@ -87,16 +97,16 @@ management, agent execution, and inference routing via gRPC.
 tar xf %{SOURCE1}
 %cargo_prep -v vendor
 
-# Patch workspace version from placeholder to actual version
-sed -i 's/^version = "0.0.0"/version = "%{version}"/' Cargo.toml
-grep -q 'version = "%{version}"' Cargo.toml || (echo "ERROR: Cargo.toml version patch failed" && exit 1)
+# Patch workspace version from placeholder to actual build identity.
+sed -i 's/^version = "0.0.0"/version = "%{openshell_cargo_version}"/' Cargo.toml
+grep -q 'version = "%{openshell_cargo_version}"' Cargo.toml || (echo "ERROR: Cargo.toml version patch failed" && exit 1)
 
 %build
 # Build the CLI and gateway binaries
 export CARGO_BUILD_JOBS=%{_smp_build_ncpus}
 # Set the default container image tag so compiled-in image refs point at
 # real tags in the ghcr.io/nvidia/openshell registry.
-export OPENSHELL_IMAGE_TAG=latest
+export OPENSHELL_IMAGE_TAG=%{image_tag}
 cargo build --release --bin openshell --bin openshell-gateway
 
 # Generate vendored crate manifest and license metadata.
@@ -151,7 +161,7 @@ EnvironmentFile=-%%E/openshell/gateway.env
 Environment=OPENSHELL_BIND_ADDRESS=0.0.0.0
 Environment=OPENSHELL_DRIVERS=podman
 Environment=OPENSHELL_DB_URL=sqlite://%%S/openshell/gateway.db
-Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:latest
+Environment=OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:%{image_tag}
 Environment=OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 # mTLS: auto-generated certs in the state directory.
 Environment=OPENSHELL_TLS_CERT=%%S/openshell/tls/server/tls.crt
@@ -180,6 +190,10 @@ EOF
 install -d %{buildroot}%{_libexecdir}/%{name}
 install -pm 0755 deploy/rpm/init-pki.sh %{buildroot}%{_libexecdir}/%{name}/init-pki.sh
 install -pm 0755 deploy/rpm/init-gateway-env.sh %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
+# Patch commented image defaults to match the build type (dev or latest).
+# The source file uses :latest as a generic reference; the installed copy
+# reflects what this RPM actually expects from the registry.
+sed -i 's|supervisor:latest|supervisor:%{image_tag}|' %{buildroot}%{_libexecdir}/%{name}/init-gateway-env.sh
 
 # --- Gateway documentation ---
 install -d %{buildroot}%{_docdir}/%{name}-gateway
@@ -203,11 +217,11 @@ install -pm 0644 python/%{name}/_proto/__init__.py %{buildroot}%{python3_sitelib
 install -pm 0644 python/%{name}/_proto/*.py %{buildroot}%{python3_sitelib}/%{name}/_proto/
 
 # Create dist-info so importlib.metadata can resolve the package version
-install -d %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info
-cat > %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/METADATA << EOF
+install -d %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info
+cat > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/METADATA << EOF
 Metadata-Version: 2.1
 Name: %{name}
-Version: 0.0.37
+Version: %{openshell_python_version}
 Summary: OpenShell Python SDK for agent execution and management
 License: Apache-2.0
 Requires-Python: >=3.12
@@ -217,10 +231,10 @@ Requires-Dist: protobuf>=4.25
 EOF
 
 # INSTALLER marker per PEP 376
-echo "rpm" > %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/INSTALLER
+echo "rpm" > %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/INSTALLER
 
 # RECORD can be empty for RPM-managed installs
-touch %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/RECORD
+touch %{buildroot}%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/RECORD
 
 %check
 # Smoke-test the CLI binary
@@ -233,7 +247,7 @@ touch %{buildroot}%{python3_sitelib}/%{name}-%{version}.dist-info/RECORD
 # We query the dist-info directly rather than importing the package because
 # the full import pulls in grpcio and other runtime deps not present in the
 # build environment.
-PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{version}', f'expected %{version}, got {v}'"
+PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata import version; v = version('openshell'); print(v); assert v == '%{openshell_python_version}', f'expected %{openshell_python_version}, got {v}'"
 
 %post gateway
 %systemd_user_post %{name}-gateway.service
@@ -269,7 +283,7 @@ PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "from importlib.metadata
 %files -n python3-%{name}
 %license LICENSE
 %{python3_sitelib}/%{name}/
-%{python3_sitelib}/%{name}-%{version}.dist-info/
+%{python3_sitelib}/%{name}-%{openshell_python_version}.dist-info/
 
 %changelog
 %autochangelog

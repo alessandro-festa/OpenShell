@@ -13,7 +13,7 @@ Use `openshell` first to identify the active endpoint. Then use the platform too
 
 The target deployment flow is:
 
-1. Operator starts or deploys the gateway.
+1. Operator starts or deploys the gateway with system packages, systemd, Helm, or a development task. The CLI does not start, stop, or destroy gateway services.
 2. Operator configures the compute driver.
 3. Operator provides TLS and SSH relay material for the deployment mode.
 4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
@@ -63,6 +63,7 @@ Use gateway metadata, deployment values, or the user's setup notes to identify t
 docker info
 docker ps --filter name=openshell
 docker logs <container> --tail=200
+docker run --rm --entrypoint /openshell-sandbox "${OPENSHELL_DOCKER_SUPERVISOR_IMAGE:-ghcr.io/nvidia/openshell/supervisor:latest}" --version
 openshell status
 ```
 
@@ -71,6 +72,7 @@ Common findings:
 - Docker daemon unavailable: start Docker Desktop or Docker Engine.
 - Gateway process stopped: inspect exit status and logs.
 - Sandbox image missing or pull denied: verify image reference and registry credentials.
+- Docker driver cannot initialize because it cannot find `openshell-sandbox`: verify `OPENSHELL_DOCKER_SUPERVISOR_BIN`, the sibling binary next to `openshell-gateway`, or the configured supervisor image contains `/openshell-sandbox`.
 - Sandbox never registers: check gateway logs and supervisor callback endpoint.
 
 For source checkout development, restart the local gateway with:
@@ -198,6 +200,7 @@ openshell logs <sandbox-name>
 | Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell` |
 | CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
 | Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
+| `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only after Envoy Gateway is installed and `grpcRoute` is enabled |
 
 ## Reporting
 

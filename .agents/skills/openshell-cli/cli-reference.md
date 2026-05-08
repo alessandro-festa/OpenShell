@@ -27,8 +27,10 @@ openshell
 ├── gateway
 │   ├── add <endpoint> [opts]
 │   ├── login [name]
-│   ├── destroy [opts]
+│   ├── logout [name]
+│   ├── remove [name]
 │   ├── info [--name]
+│   ├── list
 │   └── select [name]
 ├── status
 ├── inference
@@ -62,8 +64,7 @@ openshell
 │   ├── update <name> --type [opts]
 │   └── delete <name>...
 ├── doctor
-│   ├── logs [--name] [-n] [--tail] [--remote] [--ssh-key]
-│   └── exec [--name] [--remote] [--ssh-key] -- <command...>
+│   └── check
 ├── term
 ├── completions <shell>
 └── ssh-proxy [opts]
@@ -82,16 +83,15 @@ Register an existing gateway endpoint.
 | `--name <NAME>` | Gateway name |
 | `--local` | Register a local endpoint, commonly a trusted port-forward |
 | `--remote <USER@HOST>` | Register a remote gateway associated with an SSH destination |
-| `--ssh-key <PATH>` | SSH private key for the remote host |
 
 Examples:
 
 - `openshell gateway add http://127.0.0.1:8080 --local --name local`
 - `openshell gateway add https://gateway.example.com --name production`
 
-### `openshell gateway destroy`
+### `openshell gateway remove [name]`
 
-Remove a gateway registration. For Helm deployments this affects local CLI metadata only; it does not uninstall the Helm release.
+Remove a local gateway registration. This removes CLI metadata and stored auth tokens only; package managers, systemd, Helm, Docker, and other platform tools still own the gateway process.
 
 ### `openshell gateway login [name]`
 
@@ -107,38 +107,17 @@ Show gateway details: endpoint, auth mode, and remote host metadata when present
 
 ### `openshell gateway select [name]`
 
-Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
+Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When called without arguments, lists all registered gateways with the active one marked with `*`.
 
 ---
 
 ## Doctor Commands
 
-### `openshell doctor logs`
+### `openshell doctor check`
 
-Fetch logs when gateway metadata supports it. For Helm deployments, prefer `kubectl -n openshell logs statefulset/openshell`.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | active gateway | Gateway name |
-| `-n, --lines <N>` | all | Number of log lines to return |
-| `--tail` | false | Stream live logs (follow mode) |
-| `--remote <USER@HOST>` | auto-resolved | SSH destination for remote gateways |
-| `--ssh-key <PATH>` | none | SSH private key for remote gateways |
-
-### `openshell doctor exec -- <COMMAND...>`
-
-Run a diagnostic command when gateway metadata supports it. For Helm deployments, prefer direct `kubectl` and `helm` commands.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | active gateway | Gateway name |
-| `--remote <USER@HOST>` | auto-resolved | SSH destination for remote gateways |
-| `--ssh-key <PATH>` | none | SSH private key for remote gateways |
-
-Examples:
-- `kubectl -n openshell get pods`
-- `kubectl -n openshell logs statefulset/openshell`
-- `helm -n openshell status openshell`
+Validate local Docker prerequisites for standalone gateway development. For
+package-managed or Helm gateways, use `systemctl`, `journalctl`, `kubectl`, and
+`helm` directly.
 
 ---
 
