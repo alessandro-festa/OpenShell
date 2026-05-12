@@ -110,6 +110,23 @@ fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
     )
 }
 
+/// Reports whether a per-connection error from `service.serve()` represents
+/// a remote peer closing the channel rather than a server-side fault. Sandbox
+/// supervisors disconnect on idle scale-down, which floods journald with
+/// `ERROR Connection error` lines if every termination is logged at error
+/// severity. Mirrors the logic of `is_benign_tls_handshake_failure` for the
+/// multiplexed HTTP/gRPC service path.
+fn is_benign_connection_close(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io) = err.downcast_ref::<std::io::Error>() {
+        return matches!(
+            io.kind(),
+            ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset | ErrorKind::BrokenPipe,
+        );
+    }
+    let s = err.to_string();
+    s.contains("stream closed") || s.contains("GOAWAY") || s.contains("incomplete frame")
+}
+
 impl ServerState {
     /// Create new server state.
     #[must_use]
@@ -399,7 +416,11 @@ fn spawn_gateway_connection(
             match acceptor.inner().accept(stream).await {
                 Ok(tls_stream) => {
                     if let Err(e) = service.serve(tls_stream).await {
-                        error!(error = %e, client = %addr, "Connection error");
+                        if is_benign_connection_close(e.as_ref()) {
+                            debug!(error = %e, client = %addr, "Connection closed");
+                        } else {
+                            error!(error = %e, client = %addr, "Connection error");
+                        }
                     }
                 }
                 Err(e) => {
@@ -414,7 +435,11 @@ fn spawn_gateway_connection(
     } else {
         tokio::spawn(async move {
             if let Err(e) = service.serve(stream).await {
-                error!(error = %e, client = %addr, "Connection error");
+                if is_benign_connection_close(e.as_ref()) {
+                    debug!(error = %e, client = %addr, "Connection closed");
+                } else {
+                    error!(error = %e, client = %addr, "Connection error");
+                }
             }
         });
     }
