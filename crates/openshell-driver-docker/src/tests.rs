@@ -165,6 +165,88 @@ fn docker_gateway_route_uses_host_gateway_for_docker_desktop() {
 }
 
 #[test]
+fn docker_gateway_route_uses_host_gateway_for_colima() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        name: Some("colima".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_colima_named_profile() {
+    let info = SystemInfo {
+        operating_system: Some("Ubuntu 24.04 LTS".to_string()),
+        // `colima start --profile <name>` sets the daemon hostname to
+        // `colima-<name>`; the prefix match still catches it.
+        name: Some("colima-default".to_string()),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_rancher_desktop() {
+    let info = SystemInfo {
+        operating_system: Some("Alpine Linux v3.20".to_string()),
+        name: Some("lima-rancher-desktop".to_string()),
+        labels: Some(vec![
+            "dev.rancherdesktop.profile=Rancher Desktop".to_string(),
+        ]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
+fn docker_gateway_route_uses_host_gateway_for_orbstack() {
+    let info = SystemInfo {
+        operating_system: Some("OrbStack".to_string()),
+        name: Some("orbstack".to_string()),
+        labels: Some(vec!["dev.orbstack.machine_type=docker".to_string()]),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        docker_gateway_route(
+            &info,
+            IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1)),
+            DEFAULT_SERVER_PORT,
+            None,
+        ),
+        DockerGatewayRoute::HostGateway
+    );
+}
+
+#[test]
 fn docker_gateway_route_uses_bridge_gateway_for_linux_docker() {
     let info = SystemInfo {
         operating_system: Some("Ubuntu 24.04 LTS".to_string()),
@@ -317,11 +399,11 @@ fn build_environment_keeps_path_driver_controlled() {
 }
 
 #[test]
-fn build_mounts_uses_docker_tls_directory() {
-    let mounts = build_mounts(&runtime_config());
-    let targets = mounts
+fn build_binds_uses_docker_tls_directory() {
+    let binds = build_binds(&runtime_config());
+    let targets = binds
         .iter()
-        .filter_map(|mount| mount.target.clone())
+        .filter_map(|bind| bind.split(':').nth(1).map(String::from))
         .collect::<Vec<_>>();
     assert!(targets.contains(&SUPERVISOR_MOUNT_PATH.to_string()));
     assert!(targets.contains(&TLS_CA_MOUNT_PATH.to_string()));
@@ -719,6 +801,22 @@ fn docker_supervisor_image_tag_prefers_explicit_build_tags() {
     assert_eq!(
         resolve_default_docker_supervisor_image_tag(Some(""), Some(""), "0.0.0"),
         "dev",
+    );
+}
+
+#[test]
+fn docker_supervisor_image_tag_sanitizes_build_metadata_for_docker() {
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(None, None, "0.0.37-dev.156+g1d3b741ee"),
+        "0.0.37-dev.156-g1d3b741ee",
+    );
+    assert_eq!(
+        resolve_default_docker_supervisor_image_tag(
+            Some("0.0.37-dev.156+g1d3b741ee"),
+            None,
+            "0.0.0",
+        ),
+        "0.0.37-dev.156-g1d3b741ee",
     );
 }
 

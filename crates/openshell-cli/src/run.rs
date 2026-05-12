@@ -25,18 +25,19 @@ use openshell_bootstrap::{
 };
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
-    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
-    CreateProviderRequest, CreateSandboxRequest, DeleteProviderProfileRequest,
-    DeleteProviderRequest, DeleteSandboxRequest, ExecSandboxRequest, GetClusterInferenceRequest,
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
+    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest,
+    DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
+    DetachSandboxProviderRequest, ExecSandboxRequest, GetClusterInferenceRequest,
     GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
     GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
     GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicySource, PolicyStatus, Provider,
-    ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
-    Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
-    SettingScope, SettingValue, UpdateConfigRequest, UpdateProviderRequest, WatchSandboxRequest,
-    exec_sandbox_event, setting_value,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest, PolicySource,
+    PolicyStatus, Provider, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
+    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -642,6 +643,60 @@ fn mtls_certs_exist_for_endpoint(name: &str, endpoint: &str) -> bool {
     })
 }
 
+fn package_managed_tls_dirs() -> Vec<PathBuf> {
+    if let Some(path) = std::env::var_os("OPENSHELL_LOCAL_TLS_DIR") {
+        return vec![PathBuf::from(path)];
+    }
+
+    let mut dirs = Vec::new();
+
+    if cfg!(target_os = "macos") {
+        dirs.push(PathBuf::from("/opt/homebrew/var/openshell/tls"));
+        dirs.push(PathBuf::from("/usr/local/var/openshell/tls"));
+    }
+
+    let state_dir = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")));
+    if let Some(state_dir) = state_dir {
+        dirs.push(state_dir.join("openshell/tls"));
+    }
+
+    dirs
+}
+
+fn import_local_package_mtls_bundle(name: &str) -> Result<Option<PathBuf>> {
+    for dir in package_managed_tls_dirs() {
+        let ca = dir.join("ca.crt");
+        let cert = dir.join("client/tls.crt");
+        let key = dir.join("client/tls.key");
+        if !(ca.is_file() && cert.is_file() && key.is_file()) {
+            continue;
+        }
+
+        let bundle = openshell_bootstrap::pki::PkiBundle {
+            ca_cert_pem: std::fs::read_to_string(&ca)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", ca.display()))?,
+            ca_key_pem: String::new(),
+            server_cert_pem: String::new(),
+            server_key_pem: String::new(),
+            client_cert_pem: std::fs::read_to_string(&cert)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", cert.display()))?,
+            client_key_pem: std::fs::read_to_string(&key)
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to read {}", key.display()))?,
+        };
+        openshell_bootstrap::mtls::store_pki_bundle(name, &bundle)
+            .wrap_err_with(|| format!("failed to store mTLS bundle for gateway '{name}'"))?;
+
+        return Ok(Some(dir));
+    }
+
+    Ok(None)
+}
+
 fn plaintext_gateway_is_remote(endpoint: &str, remote: Option<&str>, local: bool) -> bool {
     if local {
         return false;
@@ -923,16 +978,13 @@ pub async fn gateway_add(
 
         // Verify the gateway is reachable.
         let tls = TlsOptions::default();
-        match http_health_check(&endpoint, &tls).await {
-            Ok(Some(status)) if status.is_success() => {}
-            _ => {
-                eprintln!(
-                    "{} Gateway is not reachable at {endpoint}",
-                    "⚠".yellow().bold(),
-                );
-                if !has_mtls_certs {
-                    eprintln!("  Verify the gateway is running and the endpoint is correct.");
-                }
+        if !gateway_reachable(&endpoint, &tls).await {
+            eprintln!(
+                "{} Gateway is not reachable at {endpoint}",
+                "⚠".yellow().bold(),
+            );
+            if !has_mtls_certs {
+                eprintln!("  Verify the gateway is running and the endpoint is correct.");
             }
         }
 
@@ -950,7 +1002,13 @@ pub async fn gateway_add(
 
     if remote.is_some() || local {
         // mTLS gateway (remote or local).
-        let certs_on_disk = mtls_certs_exist_for_endpoint(name, &endpoint);
+        let imported_mtls_dir = if local {
+            import_local_package_mtls_bundle(name)?
+        } else {
+            None
+        };
+        let certs_on_disk =
+            imported_mtls_dir.is_some() || mtls_certs_exist_for_endpoint(name, &endpoint);
         if !certs_on_disk {
             return Err(miette::miette!(
                 "mTLS certificates for gateway '{name}' were not found.\n\
@@ -983,14 +1041,11 @@ pub async fn gateway_add(
 
         // Verify the gateway is reachable over mTLS.
         let tls = TlsOptions::default().with_gateway_name(name);
-        match http_health_check(&endpoint, &tls).await {
-            Ok(Some(status)) if status.is_success() => {}
-            _ => {
-                eprintln!(
-                    "{} Gateway is not reachable at {endpoint}. Verify the gateway is running.",
-                    "⚠".yellow().bold(),
-                );
-            }
+        if !gateway_reachable(&endpoint, &tls).await {
+            eprintln!(
+                "{} Gateway is not reachable at {endpoint}. Verify the gateway is running.",
+                "⚠".yellow().bold(),
+            );
         }
 
         eprintln!(
@@ -1249,6 +1304,16 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
         .into_diagnostic()?;
     let resp = client.request(req).await.into_diagnostic()?;
     Ok(Some(resp.status()))
+}
+
+async fn gateway_reachable(server: &str, tls: &TlsOptions) -> bool {
+    if let Ok(mut client) = grpc_client(server, tls).await
+        && client.health(HealthRequest {}).await.is_ok()
+    {
+        return true;
+    }
+
+    matches!(http_health_check(server, tls).await, Ok(Some(status)) if status.is_success())
 }
 
 fn remove_gateway_registration(name: &str) {
@@ -2510,6 +2575,143 @@ pub async fn sandbox_list(
     }
 
     Ok(())
+}
+
+pub async fn sandbox_provider_list(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_sandbox_providers(ListSandboxProvidersRequest {
+            sandbox_name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+    let providers = response.into_inner().providers;
+
+    if providers.is_empty() {
+        println!("No providers attached to sandbox {name}.");
+        return Ok(());
+    }
+
+    print_provider_attachment_table(&providers);
+    Ok(())
+}
+
+pub async fn sandbox_provider_attach(
+    server: &str,
+    name: &str,
+    provider: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .attach_sandbox_provider(AttachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.attached {
+        println!(
+            "{} Attached provider {} to sandbox {}",
+            "✓".green().bold(),
+            provider,
+            name
+        );
+    } else {
+        println!("Provider {provider} is already attached to sandbox {name}.");
+    }
+    Ok(())
+}
+
+pub async fn sandbox_provider_detach(
+    server: &str,
+    name: &str,
+    provider: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .detach_sandbox_provider(DetachSandboxProviderRequest {
+            sandbox_name: name.to_string(),
+            provider_name: provider.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.detached {
+        println!(
+            "{} Detached provider {} from sandbox {}",
+            "✓".green().bold(),
+            provider,
+            name
+        );
+    } else {
+        println!("Provider {provider} was not attached to sandbox {name}.");
+    }
+    Ok(())
+}
+
+fn print_provider_attachment_table(providers: &[Provider]) {
+    print!("{}", format_provider_attachment_table(providers, true));
+}
+
+fn format_provider_attachment_table(providers: &[Provider], color: bool) -> String {
+    use std::fmt::Write as _;
+
+    let name_width = providers
+        .iter()
+        .map(|provider| provider.object_name().len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let type_width = providers
+        .iter()
+        .map(|provider| provider.r#type.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    let name_header = if color {
+        "NAME".bold().to_string()
+    } else {
+        "NAME".to_string()
+    };
+    let type_header = if color {
+        "TYPE".bold().to_string()
+    } else {
+        "TYPE".to_string()
+    };
+    let credential_keys_header = if color {
+        "CREDENTIAL_KEYS".bold().to_string()
+    } else {
+        "CREDENTIAL_KEYS".to_string()
+    };
+    let config_keys_header = if color {
+        "CONFIG_KEYS".bold().to_string()
+    } else {
+        "CONFIG_KEYS".to_string()
+    };
+
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "{name_header:<name_width$}  {type_header:<type_width$}  {credential_keys_header:<16}  {config_keys_header}",
+    );
+
+    for provider in providers {
+        let provider_name = provider.object_name();
+        let provider_type = &provider.r#type;
+        let credential_keys = provider.credentials.len();
+        let config_keys = provider.config.len();
+        let _ = writeln!(
+            output,
+            "{provider_name:<name_width$}  {provider_type:<type_width$}  {credential_keys:<16}  {config_keys}",
+        );
+    }
+    output
 }
 
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
@@ -5220,15 +5422,55 @@ pub async fn sandbox_draft_history(server: &str, name: &str, tls: &TlsOptions) -
 fn format_endpoints(rule: &openshell_core::proto::NetworkPolicyRule) -> String {
     rule.endpoints
         .iter()
-        .map(|e| {
-            if e.port > 0 {
-                format!("{}:{}", e.host, e.port)
-            } else {
-                e.host.clone()
-            }
-        })
+        .map(format_endpoint)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Render an endpoint as `host:port [layer, …allows…, …denies…]` so a reader
+/// can tell L4-only access apart from a method/path-scoped L7 grant. The L7
+/// fields (`protocol: rest`, `rules`, `access`) materially change what gets
+/// allowed; surfacing them in the default text output is what makes
+/// `openshell rule get` useful for approval review.
+fn format_endpoint(endpoint: &openshell_core::proto::NetworkEndpoint) -> String {
+    let host_port = if endpoint.port > 0 {
+        format!("{}:{}", endpoint.host, endpoint.port)
+    } else {
+        endpoint.host.clone()
+    };
+
+    let mut tags: Vec<String> = Vec::new();
+    let layer_tag = if endpoint.protocol.eq_ignore_ascii_case("rest") {
+        "L7 rest"
+    } else if endpoint.protocol.is_empty() {
+        "L4"
+    } else {
+        endpoint.protocol.as_str()
+    };
+    tags.push(layer_tag.to_string());
+
+    if !endpoint.access.is_empty() {
+        tags.push(format!("access={}", endpoint.access));
+    }
+
+    for r in &endpoint.rules {
+        if let Some(allow) = &r.allow {
+            let method = non_empty_or(&allow.method, "*");
+            let path = non_empty_or(&allow.path, "*");
+            tags.push(format!("allow {method} {path}"));
+        }
+    }
+    for r in &endpoint.deny_rules {
+        let method = non_empty_or(&r.method, "*");
+        let path = non_empty_or(&r.path, "*");
+        tags.push(format!("deny {method} {path}"));
+    }
+
+    format!("{host_port} [{}]", tags.join(", "))
+}
+
+fn non_empty_or<'a>(value: &'a str, fallback: &'a str) -> &'a str {
+    if value.is_empty() { fallback } else { value }
 }
 
 /// Format a millisecond timestamp into a readable string.
@@ -5250,10 +5492,12 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, dockerfile_sources_supported_for_gateway, format_gateway_select_header,
-        format_gateway_select_items, gateway_add, gateway_auth_label, gateway_env_override_warning,
-        gateway_select_with, gateway_type_label, git_sync_files, http_health_check,
-        image_requests_gpu, inferred_provider_type, parse_cli_setting_value,
+        TlsOptions, dockerfile_sources_supported_for_gateway, format_endpoint,
+        format_gateway_select_header, format_gateway_select_items,
+        format_provider_attachment_table, gateway_add, gateway_auth_label,
+        gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
+        http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
         parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
         ready_false_condition_message, resolve_from, sandbox_should_persist,
     };
@@ -5263,12 +5507,14 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
 
     use openshell_bootstrap::GatewayMetadata;
-    use openshell_core::proto::{SandboxCondition, SandboxStatus};
+    use openshell_core::proto::{
+        Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
+    };
 
     struct EnvVarGuard {
         key: &'static str,
@@ -5369,6 +5615,40 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn provider_attachment_table_formats_provider_counts() {
+        let output = format_provider_attachment_table(
+            &[Provider {
+                metadata: Some(ObjectMeta {
+                    name: "work-custom".to_string(),
+                    ..Default::default()
+                }),
+                r#type: "custom-api".to_string(),
+                credentials: [
+                    ("CUSTOM_API_KEY".to_string(), "REDACTED".to_string()),
+                    ("CUSTOM_API_SECRET".to_string(), "REDACTED".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+                config: std::iter::once((
+                    "BASE_URL".to_string(),
+                    "https://api.custom.example".to_string(),
+                ))
+                .collect(),
+            }],
+            false,
+        );
+
+        assert!(output.contains("NAME"));
+        assert!(output.contains("TYPE"));
+        assert!(output.contains("CREDENTIAL_KEYS"));
+        assert!(output.contains("CONFIG_KEYS"));
+        assert!(output.contains("work-custom"));
+        assert!(output.contains("custom-api"));
+        assert!(output.contains('2'));
+        assert!(output.contains('1'));
     }
 
     #[cfg(feature = "dev-settings")]
@@ -5849,6 +6129,52 @@ mod tests {
     }
 
     #[test]
+    fn package_managed_tls_dirs_respects_override() {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _tls_dir = EnvVarGuard::set("OPENSHELL_LOCAL_TLS_DIR", "/tmp/openshell-test-tls");
+
+        assert_eq!(
+            package_managed_tls_dirs(),
+            vec![PathBuf::from("/tmp/openshell-test-tls")],
+        );
+    }
+
+    #[test]
+    fn import_local_package_mtls_bundle_copies_client_materials() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let package_tls = tmpdir.path().join("package-tls");
+        fs::create_dir_all(package_tls.join("client")).expect("create package tls dir");
+        fs::write(package_tls.join("ca.crt"), "ca").expect("write ca");
+        fs::write(package_tls.join("client/tls.crt"), "client cert").expect("write cert");
+        fs::write(package_tls.join("client/tls.key"), "client key").expect("write key");
+
+        with_tmp_xdg(tmpdir.path(), || {
+            let _tls_dir = EnvVarGuard::set(
+                "OPENSHELL_LOCAL_TLS_DIR",
+                package_tls.to_str().expect("temp path should be utf-8"),
+            );
+
+            let imported =
+                import_local_package_mtls_bundle("openshell").expect("import local bundle");
+
+            assert_eq!(imported.as_deref(), Some(package_tls.as_path()));
+
+            let mtls = tmpdir.path().join("openshell/gateways/openshell/mtls");
+            assert_eq!(fs::read_to_string(mtls.join("ca.crt")).unwrap(), "ca");
+            assert_eq!(
+                fs::read_to_string(mtls.join("tls.crt")).unwrap(),
+                "client cert",
+            );
+            assert_eq!(
+                fs::read_to_string(mtls.join("tls.key")).unwrap(),
+                "client key",
+            );
+        });
+    }
+
+    #[test]
     fn plaintext_gateway_locality_infers_loopback_endpoints_as_local() {
         assert!(!plaintext_gateway_is_remote(
             "http://127.0.0.1:8080",
@@ -5968,5 +6294,51 @@ mod tests {
 
         server.join().expect("server thread");
         assert_eq!(status, Some(StatusCode::OK));
+    }
+    #[test]
+    fn format_endpoint_distinguishes_l4_from_l7_rest() {
+        use openshell_core::proto::{L7Allow, L7DenyRule, L7Rule, NetworkEndpoint};
+
+        let l4 = NetworkEndpoint {
+            host: "host.example.test".to_string(),
+            port: 443,
+            ..Default::default()
+        };
+        assert_eq!(format_endpoint(&l4), "host.example.test:443 [L4]");
+
+        let l7_readonly = NetworkEndpoint {
+            host: "host.example.test".to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            access: "read-only".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_endpoint(&l7_readonly),
+            "host.example.test:443 [L7 rest, access=read-only]"
+        );
+
+        let l7_scoped = NetworkEndpoint {
+            host: "host.example.test".to_string(),
+            port: 443,
+            protocol: "rest".to_string(),
+            rules: vec![L7Rule {
+                allow: Some(L7Allow {
+                    method: "PUT".to_string(),
+                    path: "/v1/example/resource".to_string(),
+                    ..Default::default()
+                }),
+            }],
+            deny_rules: vec![L7DenyRule {
+                method: "DELETE".to_string(),
+                path: "/v1/example/resource".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            format_endpoint(&l7_scoped),
+            "host.example.test:443 [L7 rest, allow PUT /v1/example/resource, deny DELETE /v1/example/resource]"
+        );
     }
 }

@@ -9,8 +9,8 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, ContainerSummary, ContainerSummaryStateEnum, DeviceRequest,
-    EndpointSettings, HostConfig, Mount, MountTypeEnum, NetworkCreateRequest, NetworkingConfig,
-    RestartPolicy, RestartPolicyNameEnum, SystemInfo,
+    EndpointSettings, HostConfig, NetworkCreateRequest, NetworkingConfig, RestartPolicy,
+    RestartPolicyNameEnum, SystemInfo,
 };
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptions, DownloadFromContainerOptionsBuilder,
@@ -89,7 +89,7 @@ pub fn default_docker_supervisor_image() -> String {
 /// fallback covers image build wrappers that already tag the gateway and
 /// supervisor together. Standalone release binaries also patch the Cargo
 /// package version, so use it when it has been set to a real release value.
-fn default_docker_supervisor_image_tag() -> &'static str {
+fn default_docker_supervisor_image_tag() -> String {
     resolve_default_docker_supervisor_image_tag(
         option_env!("OPENSHELL_IMAGE_TAG"),
         option_env!("IMAGE_TAG"),
@@ -101,8 +101,8 @@ fn resolve_default_docker_supervisor_image_tag(
     openshell_image_tag: Option<&'static str>,
     image_tag: Option<&'static str>,
     cargo_pkg_version: &'static str,
-) -> &'static str {
-    openshell_image_tag
+) -> String {
+    let tag = openshell_image_tag
         .filter(|tag| !tag.is_empty())
         .or_else(|| image_tag.filter(|tag| !tag.is_empty()))
         .unwrap_or_else(|| {
@@ -111,7 +111,9 @@ fn resolve_default_docker_supervisor_image_tag(
             } else {
                 cargo_pkg_version
             }
-        })
+        });
+
+    tag.replace('+', "-")
 }
 
 /// Queried by the Docker driver to decide when a sandbox's supervisor
@@ -863,28 +865,22 @@ impl ComputeDriver for DockerComputeDriver {
     }
 }
 
-fn build_mounts(config: &DockerDriverRuntimeConfig) -> Vec<Mount> {
-    let mut mounts = vec![bind_mount(
-        &config.supervisor_bin,
-        SUPERVISOR_MOUNT_PATH,
-        true,
+fn build_binds(config: &DockerDriverRuntimeConfig) -> Vec<String> {
+    let mut binds = vec![format!(
+        "{}:{}:ro,z",
+        config.supervisor_bin.display(),
+        SUPERVISOR_MOUNT_PATH
     )];
     if let Some(tls) = &config.guest_tls {
-        mounts.push(bind_mount(&tls.ca, TLS_CA_MOUNT_PATH, true));
-        mounts.push(bind_mount(&tls.cert, TLS_CERT_MOUNT_PATH, true));
-        mounts.push(bind_mount(&tls.key, TLS_KEY_MOUNT_PATH, true));
+        binds.push(format!("{}:{}:ro,z", tls.ca.display(), TLS_CA_MOUNT_PATH));
+        binds.push(format!(
+            "{}:{}:ro,z",
+            tls.cert.display(),
+            TLS_CERT_MOUNT_PATH
+        ));
+        binds.push(format!("{}:{}:ro,z", tls.key.display(), TLS_KEY_MOUNT_PATH));
     }
-    mounts
-}
-
-fn bind_mount(source: &Path, target: &str, read_only: bool) -> Mount {
-    Mount {
-        target: Some(target.to_string()),
-        source: Some(source.display().to_string()),
-        typ: Some(MountTypeEnum::BIND),
-        read_only: Some(read_only),
-        ..Default::default()
-    }
+    binds
 }
 
 fn build_environment(sandbox: &DriverSandbox, config: &DockerDriverRuntimeConfig) -> Vec<String> {
@@ -997,7 +993,7 @@ fn build_container_create_body(
             nano_cpus: resource_limits.nano_cpus,
             memory: resource_limits.memory_bytes,
             device_requests: docker_gpu_device_requests(spec.gpu),
-            mounts: Some(build_mounts(config)),
+            binds: Some(build_binds(config)),
             restart_policy: Some(RestartPolicy {
                 name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
                 maximum_retry_count: None,
@@ -1103,7 +1099,7 @@ fn docker_gateway_route(
         };
     }
 
-    if is_docker_desktop(info) {
+    if is_compat_docker_runtime(info) {
         DockerGatewayRoute::HostGateway
     } else {
         DockerGatewayRoute::Bridge {
@@ -1113,7 +1109,15 @@ fn docker_gateway_route(
     }
 }
 
-fn is_docker_desktop(info: &SystemInfo) -> bool {
+/// Detect Docker Desktop and behaviourally compatible runtimes — Colima,
+/// Lima, Rancher Desktop, and `OrbStack` — that share Docker Desktop's
+/// routing constraint: the bridge gateway IP is reachable from inside
+/// containers but not from the `OpenShell` server process running on the
+/// host, so callbacks must traverse `host-gateway`.
+///
+/// Each runtime is detected via the daemon's reported OS string or hostname,
+/// supplemented by labels where the runtime publishes them.
+fn is_compat_docker_runtime(info: &SystemInfo) -> bool {
     let operating_system = info
         .operating_system
         .as_deref()
@@ -1123,10 +1127,25 @@ fn is_docker_desktop(info: &SystemInfo) -> bool {
         return true;
     }
 
+    let name = info
+        .name
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.starts_with("colima")
+        || name.starts_with("lima-")
+        || name.starts_with("rancher-desktop")
+        || name.starts_with("orbstack")
+    {
+        return true;
+    }
+
     info.labels.as_ref().is_some_and(|labels| {
-        labels
-            .iter()
-            .any(|label| label.starts_with("com.docker.desktop."))
+        labels.iter().any(|label| {
+            label.starts_with("com.docker.desktop.")
+                || label.starts_with("dev.rancherdesktop.")
+                || label.starts_with("dev.orbstack.")
+        })
     })
 }
 

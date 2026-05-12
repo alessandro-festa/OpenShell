@@ -244,8 +244,8 @@ backend = "core:python"
 precompiled_flavor = "install_only_stripped"
 
 [tools.python."platforms.linux-arm64"]
-checksum = "sha256:7fda891fac489ae1380fdf7050acf5ed4d3cb1ce0a84d6a4a6f51f6b5aee2d6d"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:67c837838c56a7d16187d1be9fad326a617e0b1ee2687e1a0dda0c85053dac33"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.13.13+20260510-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-arm64-musl"]
@@ -254,8 +254,8 @@ url = "https://github.com/astral-sh/python-build-standalone/releases/download/20
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64"]
-checksum = "sha256:701c00bb8cc5b172b9c8a31eb6be57b6bc72cfe0addbff8e013db79a28981642"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+checksum = "sha256:bbe27549e475fe5f22d42a8e0d553dc79d80d8a00e05712599637857d287360e"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.13.13+20260510-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.linux-x64-musl"]
@@ -264,8 +264,8 @@ url = "https://github.com/astral-sh/python-build-standalone/releases/download/20
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-arm64"]
-checksum = "sha256:001872dfdea7fdb5b985cbe03a5b15d1ba7d8a5df6056615d433423e2adb27c5"
-url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260504/cpython-3.13.13+20260504-aarch64-apple-darwin-install_only_stripped.tar.gz"
+checksum = "sha256:16d2332d950178968534e65fe09f01f876d13af1147176fd0c77a74c9e4d1a4b"
+url = "https://github.com/astral-sh/python-build-standalone/releases/download/20260510/cpython-3.13.13+20260510-aarch64-apple-darwin-install_only_stripped.tar.gz"
 provenance = "github-attestations"
 
 [tools.python."platforms.macos-x64"]
@@ -293,7 +293,6 @@ url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-a
 url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-arm64"
 
 [tools.skaffold."platforms.linux-x64"]
-checksum = "blake3:de828fa7e9d89de048a6e89425cbdac7199d59a9fb0750b44ffe31734c074104"
 url = "https://storage.googleapis.com/skaffold/releases/v2.19.0/skaffold-linux-amd64"
 
 [tools.skaffold."platforms.linux-x64-musl"]

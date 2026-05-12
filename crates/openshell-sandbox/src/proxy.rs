@@ -8,6 +8,8 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine, PolicyGenerationGuard};
 use crate::policy::ProxyPolicy;
+use crate::policy_local::{POLICY_LOCAL_HOST, PolicyLocalContext};
+use crate::provider_credentials::ProviderCredentialState;
 use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
 use openshell_core::net::{is_always_blocked_ip, is_internal_ip};
@@ -147,7 +149,7 @@ impl ProxyHandle {
     /// The proxy uses OPA for network decisions with process-identity binding
     /// via `/proc/net/tcp`. All connections are evaluated through OPA policy.
     #[allow(clippy::too_many_arguments)]
-    pub async fn start_with_bind_addr(
+    pub(crate) async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
@@ -155,7 +157,8 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
-        secret_resolver: Option<Arc<SecretResolver>>,
+        provider_credentials: Option<ProviderCredentialState>,
+        policy_local_ctx: Option<Arc<PolicyLocalContext>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -194,11 +197,22 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
-                        let resolver = secret_resolver.clone();
+                        let policy_local = policy_local_ctx.clone();
+                        let resolver = provider_credentials
+                            .as_ref()
+                            .and_then(ProviderCredentialState::resolver);
                         let dtx = denial_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream,
+                                opa,
+                                cache,
+                                spid,
+                                tls,
+                                inf,
+                                policy_local,
+                                resolver,
+                                dtx,
                             )
                             .await
                             {
@@ -313,6 +327,7 @@ async fn handle_tcp_connection(
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -357,6 +372,7 @@ async fn handle_tcp_connection(
             opa_engine,
             identity_cache,
             entrypoint_pid,
+            policy_local_ctx,
             secret_resolver,
             denial_tx.as_ref(),
         )
@@ -2408,6 +2424,7 @@ async fn handle_forward_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    policy_local_ctx: Option<Arc<PolicyLocalContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -2430,6 +2447,38 @@ async fn handle_forward_proxy(
         }
     };
     let host_lc = host.to_ascii_lowercase();
+
+    if host_lc == POLICY_LOCAL_HOST {
+        if scheme != "http" || port != 80 {
+            respond(
+                client,
+                &build_json_error_response(
+                    400,
+                    "Bad Request",
+                    "invalid_policy_local_scheme",
+                    "Use http://policy.local only",
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        if let Some(ctx) = policy_local_ctx {
+            return crate::policy_local::handle_forward_request(
+                &ctx,
+                method,
+                &path,
+                &buf[..used],
+                client,
+            )
+            .await;
+        }
+        respond(
+            client,
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\n\r\npolicy.local is not configured",
+        )
+        .await?;
+        return Ok(());
+    }
 
     // 2. Reject HTTPS — must use CONNECT for TLS
     if scheme == "https" {

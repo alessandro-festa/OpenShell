@@ -63,7 +63,7 @@ spec:
             - {{ .Values.server.dbUrl | quote }}
           env:
             - name: OPENSHELL_SANDBOX_NAMESPACE
-              value: {{ .Values.server.sandboxNamespace | quote }}
+              value: {{ include "openshell.sandboxNamespace" . | quote }}
             - name: OPENSHELL_SANDBOX_IMAGE
               value: {{ .Values.server.sandboxImage | quote }}
             {{- if .Values.server.sandboxImagePullPolicy }}
@@ -77,7 +77,7 @@ spec:
               value: {{ .Values.supervisor.image.pullPolicy | quote }}
             {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
-              value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
+              value: {{ include "openshell.grpcEndpoint" . | quote }}
             {{- if .Values.server.sshGatewayHost }}
             - name: OPENSHELL_SSH_GATEWAY_HOST
               value: {{ .Values.server.sshGatewayHost | quote }}
@@ -89,6 +89,10 @@ spec:
             {{- if .Values.server.hostGatewayIP }}
             - name: OPENSHELL_HOST_GATEWAY_IP
               value: {{ .Values.server.hostGatewayIP | quote }}
+            {{- end }}
+            {{- if .Values.server.enableUserNamespaces }}
+            - name: OPENSHELL_ENABLE_USER_NAMESPACES
+              value: "true"
             {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               valueFrom:
