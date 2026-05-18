@@ -20,6 +20,7 @@ use tokio::time::sleep;
 
 const MANAGED_BY_LABEL_FILTER: &str = "label=openshell.ai/managed-by=openshell";
 const READY_MARKER: &str = "gateway-resume-ready";
+const RESUME_FILE: &str = "/sandbox/gateway-resume-state";
 const SANDBOX_NAMESPACE_LABEL: &str = "openshell.ai/sandbox-namespace";
 const SANDBOX_NAME_LABEL: &str = "openshell.ai/sandbox-name";
 
@@ -75,6 +76,46 @@ async fn sandbox_names() -> Result<Vec<String>, String> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect())
+}
+
+async fn wait_for_sandbox_exec_contains(
+    sandbox_name: &str,
+    command: &[&str],
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last_output: String;
+
+    loop {
+        let mut cmd = openshell_cmd();
+        cmd.args(["sandbox", "exec", "--name", sandbox_name, "--no-tty", "--"])
+            .args(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        match cmd.output().await {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                last_output = strip_ansi(&format!("{stdout}{stderr}"));
+                if output.status.success() && last_output.contains(expected) {
+                    return Ok(());
+                }
+            }
+            Err(err) => {
+                last_output = format!("failed to spawn openshell sandbox exec: {err}");
+            }
+        }
+
+        if start.elapsed() > timeout {
+            return Err(format!(
+                "sandbox '{sandbox_name}' exec did not produce '{expected}' within {}s. Last output:\n{last_output}",
+                timeout.as_secs()
+            ));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
 }
 
 fn sandbox_container_id(namespace: &str, sandbox_name: &str) -> Result<String, String> {
@@ -187,16 +228,24 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         .await
         .expect("gateway should start healthy");
 
+    let script = format!(
+        "echo before-restart > {RESUME_FILE}; echo {READY_MARKER}; while true; do sleep 1; done"
+    );
     let mut sandbox = SandboxGuard::create_keep(
-        &[
-            "sh",
-            "-c",
-            "echo gateway-resume-ready; while true; do sleep 1; done",
-        ],
+        &["sh", "-lc", &script],
         READY_MARKER,
     )
     .await
     .expect("create long-running sandbox");
+
+    let before_restart = sandbox
+        .exec(&["cat", RESUME_FILE])
+        .await
+        .expect("read sandbox state before restart");
+    assert!(
+        before_restart.contains("before-restart"),
+        "sandbox state was not written before restart:\n{before_restart}"
+    );
 
     wait_for_container_running(&namespace, &sandbox.name, true, Duration::from_secs(60))
         .await
@@ -221,6 +270,15 @@ async fn docker_gateway_restart_resumes_running_sandbox() {
         "sandbox '{}' should still be listed after gateway restart. Names: {names:?}",
         sandbox.name
     );
+
+    wait_for_sandbox_exec_contains(
+        &sandbox.name,
+        &["cat", RESUME_FILE],
+        "before-restart",
+        Duration::from_secs(240),
+    )
+    .await
+    .expect("sandbox should become ready again with its state preserved");
 
     sandbox.cleanup().await;
 }

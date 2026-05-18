@@ -33,17 +33,9 @@ The systemd user unit reads it via:
     EnvironmentFile=-~/.config/openshell/gateway.env
 
 The **-** prefix means the service starts normally if the file does not
-exist (the unit has built-in defaults for all required settings except
-the SSH handshake secret).
+exist (the unit has built-in defaults for all required settings).
 
 # VARIABLES
-
-## Required
-
-**OPENSHELL_SSH_HANDSHAKE_SECRET**
-:   Shared HMAC secret for gateway-to-sandbox SSH handshake
-    authentication. Auto-generated as a 32-byte hex string on first
-    start. To regenerate: **openssl rand -hex 32**.
 
 ## Gateway
 
@@ -74,9 +66,6 @@ the SSH handshake secret).
 **OPENSHELL_DB_URL** (default: sqlite://$XDG_STATE_HOME/openshell/gateway.db)
 :   SQLite database URL for gateway state persistence.
 
-**OPENSHELL_DISABLE_GATEWAY_AUTH** (default: unset)
-:   Set to **true** to disable mTLS client certificate verification.
-
 ## TLS
 
 **OPENSHELL_TLS_CERT** (default: auto-generated path)
@@ -86,7 +75,10 @@ the SSH handshake secret).
 :   Path to server TLS private key.
 
 **OPENSHELL_TLS_CLIENT_CA** (default: auto-generated path)
-:   Path to CA certificate for client certificate verification.
+:   Path to CA certificate for client certificate verification. When
+    set without **OPENSHELL_OIDC_ISSUER**, mTLS is required. When both
+    are set, callers may authenticate via Bearer token or client
+    certificate.
 
 **OPENSHELL_DISABLE_TLS** (default: unset)
 :   Set to **true** to disable TLS entirely and listen on plaintext
@@ -96,56 +88,23 @@ the SSH handshake secret).
     **OPENSHELL_BIND_ADDRESS** to **127.0.0.1** or place the gateway
     behind a TLS-terminating reverse proxy.
 
-**OPENSHELL_PODMAN_TLS_CA** (default: auto-generated path)
-:   CA certificate bind-mounted into sandbox containers.
+**OPENSHELL_SERVER_SAN** (default: unset)
+:   Comma-separated SANs configured on the gateway server certificate.
+    Wildcard DNS SANs also enable sandbox service URLs under that
+    domain.
 
-**OPENSHELL_PODMAN_TLS_CERT** (default: auto-generated path)
-:   Client certificate bind-mounted into sandbox containers.
+## Driver Configuration
 
-**OPENSHELL_PODMAN_TLS_KEY** (default: auto-generated path)
-:   Client private key bind-mounted into sandbox containers.
-
-## Images
-
-**OPENSHELL_SUPERVISOR_IMAGE** (default: ghcr.io/nvidia/openshell/supervisor:latest)
-:   OCI image containing the supervisor binary, mounted read-only
-    into sandbox containers.
-
-**OPENSHELL_SANDBOX_IMAGE** (default: ghcr.io/nvidia/openshell-community/sandboxes/base:latest)
-:   Default OCI image for sandbox containers.
-
-**OPENSHELL_SANDBOX_IMAGE_PULL_POLICY** (default: missing)
-:   When to pull sandbox images: **always** (every sandbox creation),
-    **missing** (only if not cached locally), **never** (use cached
-    only), **newer** (pull if a newer version exists).
-
-## Podman Driver
-
-**OPENSHELL_PODMAN_SOCKET** (default: $XDG_RUNTIME_DIR/podman/podman.sock)
-:   Path to the Podman API Unix socket.
-
-**OPENSHELL_NETWORK_NAME** (default: openshell)
-:   Name of the Podman bridge network for sandbox containers. Created
-    automatically if it does not exist.
-
-**OPENSHELL_STOP_TIMEOUT** (default: 10)
-:   Seconds to wait after SIGTERM before sending SIGKILL when stopping
-    a sandbox container.
+Compute driver settings are configured in the TOML file referenced by
+**OPENSHELL_GATEWAY_CONFIG** or **--config**. This includes sandbox
+images, image pull policy, callback endpoints, Podman socket path,
+Docker network name, VM state directory, and guest TLS material.
 
 # EXAMPLES
 
 Change the API port to 9090:
 
     OPENSHELL_SERVER_PORT=9090
-
-Pin sandbox images to a specific version:
-
-    OPENSHELL_SUPERVISOR_IMAGE=ghcr.io/nvidia/openshell/supervisor:v0.0.37
-    OPENSHELL_SANDBOX_IMAGE=ghcr.io/nvidia/openshell-community/sandboxes/base:v0.0.37
-
-Air-gapped deployment (pre-loaded images, no registry access):
-
-    OPENSHELL_SANDBOX_IMAGE_PULL_POLICY=never
 
 Enable debug logging:
 

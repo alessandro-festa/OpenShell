@@ -23,21 +23,29 @@ use openshell_bootstrap::{
     remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
     store_gateway_metadata,
 };
+use openshell_core::progress::{
+    PROGRESS_ACTIVE_DETAIL_KEY, PROGRESS_ACTIVE_STEP_KEY, PROGRESS_COMPLETE_LABEL_KEY,
+    PROGRESS_COMPLETE_STEP_KEY, PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
+    PROGRESS_STEP_STARTING_SANDBOX,
+};
 use openshell_core::proto::ProviderProfileCategory;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, AttachSandboxProviderRequest,
-    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest,
+    ClearDraftChunksRequest, CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest,
     DeleteProviderProfileRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    DetachSandboxProviderRequest, ExecSandboxRequest, GetClusterInferenceRequest,
-    GetDraftHistoryRequest, GetDraftPolicyRequest, GetGatewayConfigRequest,
-    GetProviderProfileRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ImportProviderProfilesRequest,
+    DeleteServiceRequest, DetachSandboxProviderRequest, ExecSandboxRequest, ExposeServiceRequest,
+    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    GetGatewayConfigRequest, GetProviderProfileRequest, GetProviderRequest,
+    GetSandboxConfigRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, GetServiceRequest, HealthRequest, ImportProviderProfilesRequest,
     LintProviderProfilesRequest, ListProviderProfilesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest, PolicySource,
-    PolicyStatus, Provider, ProviderProfile, ProviderProfileDiagnostic, ProviderProfileImportItem,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
+    ListSandboxPoliciesRequest, ListSandboxProvidersRequest, ListSandboxesRequest,
+    ListServicesRequest, PlatformEvent, PolicySource, PolicyStatus, Provider, ProviderProfile,
+    ProviderProfileDiagnostic, ProviderProfileImportItem, RejectDraftChunkRequest,
+    RevokeSshSessionRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    ServiceEndpointResponse, SetClusterInferenceRequest, SettingScope, SettingValue,
+    TcpForwardFrame, TcpForwardInit, TcpRelayTarget, UpdateConfigRequest, UpdateProviderRequest,
+    WatchSandboxRequest, exec_sandbox_event, setting_value, tcp_forward_init,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_core::{ObjectId, ObjectName};
@@ -193,26 +201,6 @@ impl ProvisioningStep {
     }
 }
 
-/// Kubernetes event reason codes we care about.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KubeEventReason {
-    Scheduled,
-    Pulling,
-    Pulled,
-    Started,
-}
-
-/// Map a Kubernetes event reason string to an enum.
-fn parse_kube_event_reason(reason: &str) -> Option<KubeEventReason> {
-    match reason {
-        "Scheduled" => Some(KubeEventReason::Scheduled),
-        "Pulling" => Some(KubeEventReason::Pulling),
-        "Pulled" => Some(KubeEventReason::Pulled),
-        "Started" => Some(KubeEventReason::Started),
-        _ => None,
-    }
-}
-
 /// Live-updating display showing a provisioning step checklist with spinner.
 ///
 /// Completed steps are printed as static `✓ Step` lines.  The current
@@ -267,14 +255,6 @@ impl ProvisioningDisplay {
             active_detail: String::new(),
             step_start: now,
         }
-    }
-
-    /// Record a completed provisioning step.
-    ///
-    /// The step is printed as a static `✓` line and the spinner advances
-    /// to the next expected state.
-    fn complete_step(&mut self, step: ProvisioningStep) {
-        self.complete_step_with_label(step, step.completed_label());
     }
 
     /// Record a completed provisioning step with a custom label.
@@ -379,34 +359,106 @@ fn format_timestamp(d: Duration) -> String {
     format!("[{secs:.1}s]")
 }
 
-/// Extract image size in bytes from a Kubernetes Pulled event message.
-/// Example: "Successfully pulled image ... Image size: 620405524 bytes."
-fn extract_image_size(message: &str) -> Option<u64> {
-    let size_prefix = "Image size: ";
-    let start = message.find(size_prefix)? + size_prefix.len();
-    let rest = &message[start..];
-    let end = rest.find(' ')?;
-    rest[..end].parse().ok()
+fn progress_step_from_metadata(value: &str) -> Option<ProvisioningStep> {
+    match value {
+        PROGRESS_STEP_REQUESTING_SANDBOX => Some(ProvisioningStep::RequestingSandbox),
+        PROGRESS_STEP_PULLING_IMAGE => Some(ProvisioningStep::PullingSandboxImage),
+        PROGRESS_STEP_STARTING_SANDBOX => Some(ProvisioningStep::StartingSandbox),
+        _ => None,
+    }
 }
 
-/// Format bytes as a human-readable string (e.g., "620 MB").
-fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = 1024 * KB;
-    const GB: u64 = 1024 * MB;
+fn noninteractive_active_label(step: ProvisioningStep) -> String {
+    step.active_label().trim_end_matches('.').to_string()
+}
 
-    if bytes >= GB {
-        // GB-scale precision loss is acceptable for a human-readable label.
-        #[allow(clippy::cast_precision_loss)]
-        let gb = bytes as f64 / GB as f64;
-        format!("{gb:.1} GB")
-    } else if bytes >= MB {
-        format!("{} MB", bytes / MB)
-    } else if bytes >= KB {
-        format!("{} KB", bytes / KB)
-    } else {
-        format!("{bytes} B")
+fn handle_platform_progress_event(
+    event: &PlatformEvent,
+    display: &mut Option<ProvisioningDisplay>,
+    provision_start: Instant,
+) -> bool {
+    let completed_step = event
+        .metadata
+        .get(PROGRESS_COMPLETE_STEP_KEY)
+        .and_then(|step| progress_step_from_metadata(step));
+    let active_step = event
+        .metadata
+        .get(PROGRESS_ACTIVE_STEP_KEY)
+        .and_then(|step| progress_step_from_metadata(step));
+    let active_detail = event
+        .metadata
+        .get(PROGRESS_ACTIVE_DETAIL_KEY)
+        .filter(|detail| !detail.is_empty());
+
+    let handled = completed_step.is_some() || active_step.is_some() || active_detail.is_some();
+    if !handled {
+        return false;
     }
+
+    if let Some(step) = completed_step {
+        let label = event
+            .metadata
+            .get(PROGRESS_COMPLETE_LABEL_KEY)
+            .map_or_else(|| step.completed_label(), String::as_str);
+        if let Some(d) = display.as_mut() {
+            d.complete_step_with_label(step, label);
+        } else {
+            let ts = format_timestamp(provision_start.elapsed());
+            println!("{} {}", ts.dimmed(), label);
+        }
+    }
+
+    if let Some(step) = active_step
+        && let Some(d) = display.as_mut()
+    {
+        d.set_active_step(step);
+    }
+
+    if let Some(detail) = active_detail {
+        if let Some(d) = display.as_mut() {
+            d.set_active_detail(detail);
+        } else {
+            let ts = format_timestamp(provision_start.elapsed());
+            if let Some(step) = active_step {
+                println!(
+                    "{} {} {}",
+                    ts.dimmed(),
+                    noninteractive_active_label(step),
+                    detail
+                );
+            } else {
+                println!("{} {}", ts.dimmed(), detail);
+            }
+        }
+    }
+
+    true
+}
+
+fn is_provisioning_progress_event(event: &PlatformEvent) -> bool {
+    if event.metadata.contains_key(PROGRESS_COMPLETE_STEP_KEY)
+        || event.metadata.contains_key(PROGRESS_ACTIVE_STEP_KEY)
+        || event.metadata.contains_key(PROGRESS_ACTIVE_DETAIL_KEY)
+    {
+        return true;
+    }
+
+    event.source == "vm"
+        && matches!(
+            event.reason.as_str(),
+            "PullingLayer"
+                | "ResolvingImage"
+                | "AuthenticatingRegistry"
+                | "FetchingManifest"
+                | "CacheHit"
+                | "CacheMiss"
+                | "WaitingForImageCacheLock"
+                | "ExportingRootfs"
+                | "PreparingRootfs"
+                | "CreatingRootDisk"
+                | "PreparingOverlay"
+                | "Started"
+        )
 }
 
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
@@ -1431,6 +1483,101 @@ fn sandbox_should_persist(
     keep || forward.is_some()
 }
 
+fn build_sandbox_resource_limits(
+    cpu: Option<&str>,
+    memory: Option<&str>,
+) -> Result<Option<prost_types::Struct>> {
+    use prost_types::{Struct, Value, value::Kind};
+
+    fn string_value(value: String) -> Value {
+        Value {
+            kind: Some(Kind::StringValue(value)),
+        }
+    }
+
+    let mut limits = std::collections::BTreeMap::new();
+    if let Some(cpu) = cpu {
+        limits.insert("cpu".to_string(), string_value(validate_cpu_quantity(cpu)?));
+    }
+    if let Some(memory) = memory {
+        limits.insert(
+            "memory".to_string(),
+            string_value(validate_memory_quantity(memory)?),
+        );
+    }
+
+    if limits.is_empty() {
+        return Ok(None);
+    }
+
+    let mut fields = std::collections::BTreeMap::new();
+    fields.insert(
+        "limits".to_string(),
+        Value {
+            kind: Some(Kind::StructValue(Struct { fields: limits })),
+        },
+    );
+    Ok(Some(Struct { fields }))
+}
+
+fn validate_cpu_quantity(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(miette!("--cpu must not be empty"));
+    }
+
+    if let Some(millicores) = value.strip_suffix('m') {
+        if millicores.is_empty() || !millicores.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(miette!(
+                "invalid --cpu value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+            ));
+        }
+        let millicores = millicores.parse::<u64>().into_diagnostic()?;
+        if millicores == 0 {
+            return Err(miette!("--cpu must be greater than zero"));
+        }
+        return Ok(value.to_string());
+    }
+
+    let cores = value.parse::<f64>().map_err(|_| {
+        miette!(
+            "invalid --cpu value '{value}': expected positive cores or millicores, for example 2, 0.5, or 500m"
+        )
+    })?;
+    if !cores.is_finite() || cores <= 0.0 {
+        return Err(miette!("--cpu must be greater than zero"));
+    }
+    Ok(value.to_string())
+}
+
+fn validate_memory_quantity(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(miette!("--memory must not be empty"));
+    }
+
+    let number_end = value
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (number, suffix) = value.split_at(number_end);
+    if number.is_empty()
+        || !matches!(
+            suffix,
+            "" | "Ki" | "Mi" | "Gi" | "Ti" | "Pi" | "Ei" | "K" | "M" | "G" | "T" | "P" | "E"
+        )
+    {
+        return Err(miette!(
+            "invalid --memory value '{value}': expected positive bytes or a quantity such as 512Mi, 4Gi, or 8G"
+        ));
+    }
+
+    let amount = number.parse::<u128>().into_diagnostic()?;
+    if amount == 0 {
+        return Err(miette!("--memory must be greater than zero"));
+    }
+    Ok(value.to_string())
+}
+
 async fn finalize_sandbox_create_session(
     server: &str,
     sandbox_name: &str,
@@ -1465,6 +1612,8 @@ pub async fn sandbox_create(
     keep: bool,
     gpu: bool,
     gpu_device: Option<&str>,
+    cpu: Option<&str>,
+    memory: Option<&str>,
     editor: Option<Editor>,
     providers: &[String],
     policy: Option<&str>,
@@ -1527,11 +1676,17 @@ pub async fn sandbox_create(
     .await?;
 
     let policy = load_sandbox_policy(policy)?;
+    let resource_limits = build_sandbox_resource_limits(cpu, memory)?;
 
-    let template = image.map(|img| SandboxTemplate {
-        image: img,
-        ..SandboxTemplate::default()
-    });
+    let template = if image.is_some() || resource_limits.is_some() {
+        Some(SandboxTemplate {
+            image: image.unwrap_or_default(),
+            resources: resource_limits,
+            ..SandboxTemplate::default()
+        })
+    } else {
+        None
+    };
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
@@ -1554,7 +1709,7 @@ pub async fn sandbox_create(
                 status.message()
             ));
         }
-        Err(status) => return Err(status).into_diagnostic(),
+        Err(status) => return Err(miette::miette!(status.to_string())),
     };
     let sandbox = response
         .into_inner()
@@ -1614,7 +1769,7 @@ pub async fn sandbox_create(
             follow_logs: true,
             follow_events: true,
             log_tail_lines: 200,
-            event_tail: 0,
+            event_tail: 50,
             stop_on_terminal: false,
             log_since_ms: 0,
             log_sources: vec!["gateway".to_string()],
@@ -1629,20 +1784,35 @@ pub async fn sandbox_create(
     let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
-    let start_time = Instant::now();
     let provision_timeout = Duration::from_secs(
         std::env::var("OPENSHELL_PROVISION_TIMEOUT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(300),
     );
+    let mut provisioning_idle_deadline = Instant::now() + provision_timeout;
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
     loop {
-        // Compute remaining time so the timeout fires even when the stream
-        // produces no events (e.g. server-side producer died).
-        let remaining = provision_timeout.saturating_sub(start_time.elapsed());
+        // Timeout only when provisioning goes idle. VM first-create can spend
+        // longer than the default timeout pulling and preparing large images,
+        // but only recognized progress events extend the idle deadline. Logs
+        // and generic status churn must not keep a stuck sandbox alive forever.
+        let remaining = provisioning_idle_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            let timeout_message = provisioning_timeout_message(
+                provision_timeout.as_secs(),
+                requested_gpu,
+                last_condition_message.as_deref(),
+            );
+            if let Some(d) = display.as_mut() {
+                d.finish_error(&timeout_message);
+            }
+            println!();
+            return Err(miette::miette!(timeout_message));
+        }
+
         let maybe_item = tokio::time::timeout(remaining, stream.next()).await;
 
         let item = match maybe_item {
@@ -1689,6 +1859,7 @@ pub async fn sandbox_create(
                                 format!("{}: {}", condition.reason, condition.message);
                         }
                     }
+                    break;
                 }
 
                 // Only accept Ready as terminal after we've observed a
@@ -1707,76 +1878,18 @@ pub async fn sandbox_create(
                 }
             }
             Some(openshell_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
-                // Map Kubernetes events to provisioning steps.
-                // We simplify the display to: Sandbox allocated -> Pulling image -> Ready
-                if let Some(reason) = parse_kube_event_reason(&ev.reason) {
-                    match reason {
-                        KubeEventReason::Scheduled => {
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step_with_label(
-                                    ProvisioningStep::RequestingSandbox,
-                                    "Sandbox allocated",
-                                );
-                                d.set_active_step(ProvisioningStep::PullingSandboxImage);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("{} Sandbox allocated", ts.dimmed());
-                            }
-                        }
-                        KubeEventReason::Pulling => {
-                            // Extract image name from the event message.
-                            let image_name = ev
-                                .message
-                                .strip_prefix("Pulling image ")
-                                .map_or("", |s| s.trim_matches('"'));
-                            if let Some(d) = display.as_mut() {
-                                d.set_active("Pulling image...");
-                                if !image_name.is_empty() {
-                                    d.set_active_detail(image_name);
-                                }
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                if image_name.is_empty() {
-                                    println!("{} Pulling image...", ts.dimmed());
-                                } else {
-                                    println!("{} Pulling image {image_name}", ts.dimmed());
-                                }
-                            }
-                        }
-                        KubeEventReason::Pulled => {
-                            // Extract image size from message like:
-                            // "Successfully pulled image ... Image size: 620405524 bytes."
-                            let size_label = extract_image_size(&ev.message)
-                                .map(format_bytes)
-                                .unwrap_or_default();
-                            let label = if size_label.is_empty() {
-                                "Image pulled".to_string()
-                            } else {
-                                format!("Image pulled ({size_label})")
-                            };
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step_with_label(
-                                    ProvisioningStep::PullingSandboxImage,
-                                    &label,
-                                );
-                                d.set_active_step(ProvisioningStep::StartingSandbox);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("{} {}", ts.dimmed(), label);
-                            }
-                        }
-                        KubeEventReason::Started => {
-                            // Only complete StartingSandbox if we've already completed
-                            // PullingSandboxImage (meaning the container is starting).
-                            if let Some(d) = display.as_mut()
-                                && d.completed_steps
-                                    .contains(&ProvisioningStep::PullingSandboxImage)
-                            {
-                                d.complete_step(ProvisioningStep::StartingSandbox);
-                            }
-                        }
+                let extends_timeout = is_provisioning_progress_event(&ev);
+                if handle_platform_progress_event(&ev, &mut display, provision_start) {
+                    if extends_timeout {
+                        provisioning_idle_deadline = Instant::now() + provision_timeout;
                     }
-                } else if let Some(d) = display.as_mut() {
+                    continue;
+                }
+                if extends_timeout {
+                    provisioning_idle_deadline = Instant::now() + provision_timeout;
+                }
+
+                if let Some(d) = display.as_mut() {
                     // Unknown events: show as detail on the current spinner.
                     if !ev.message.is_empty() {
                         d.set_active_detail(&ev.message);
@@ -2199,12 +2312,8 @@ pub async fn sandbox_sync_command(
             eprintln!("{} Sync complete", "✓".green().bold());
         }
         (None, Some(sandbox_path)) => {
-            let local_dest = Path::new(dest.unwrap_or("."));
-            eprintln!(
-                "Syncing sandbox:{} -> {}",
-                sandbox_path,
-                local_dest.display()
-            );
+            let local_dest = dest.unwrap_or(".");
+            eprintln!("Syncing sandbox:{sandbox_path} -> {local_dest}");
             sandbox_sync_down(server, name, sandbox_path, local_dest, tls).await?;
             eprintln!("{} Sync complete", "✓".green().bold());
         }
@@ -2395,6 +2504,11 @@ pub async fn sandbox_exec_grpc(
     let tty = tty_override
         .unwrap_or_else(|| std::io::stdin().is_terminal() && std::io::stdout().is_terminal());
 
+    if tty_override == Some(true) && std::io::stdin().is_terminal() {
+        return sandbox_exec_interactive_grpc(client, &sandbox, command, workdir, timeout_seconds)
+            .await;
+    }
+
     // Make the streaming gRPC call.
     let mut stream = client
         .exec_sandbox(ExecSandboxRequest {
@@ -2405,6 +2519,7 @@ pub async fn sandbox_exec_grpc(
             timeout_seconds,
             stdin: stdin_payload,
             tty,
+            ..Default::default()
         })
         .await
         .into_diagnostic()?
@@ -2434,6 +2549,440 @@ pub async fn sandbox_exec_grpc(
             None => {}
         }
     }
+
+    Ok(exit_code)
+}
+
+pub async fn service_forward_tcp(
+    server: &str,
+    name: &str,
+    local: Option<&str>,
+    target_host: &str,
+    target_port: u16,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let (bind_addr, bind_port) = parse_tcp_forward_spec(local, target_port)?;
+    let mut client = grpc_client(server, tls).await?;
+
+    let sandbox = fetch_ready_sandbox_for_forward(&mut client, name).await?;
+
+    let listener = tokio::net::TcpListener::bind((bind_addr.as_str(), bind_port))
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to bind local forward on {bind_addr}:{bind_port}"))?;
+    let local_addr = listener
+        .local_addr()
+        .into_diagnostic()
+        .wrap_err("failed to read local forward address")?;
+    eprintln!(
+        "{} Forwarding {} -> {}:{} in sandbox {} via gRPC",
+        "✓".green().bold(),
+        local_addr,
+        target_host,
+        target_port,
+        name,
+    );
+
+    let sandbox_id = sandbox.object_id().to_string();
+    let (fatal_tx, mut fatal_rx) = tokio::sync::mpsc::channel::<String>(1);
+    let mut health_check = tokio::time::interval(Duration::from_secs(2));
+    health_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            Some(reason) = fatal_rx.recv() => {
+                return Err(miette::miette!("service forward stopped: {reason}"));
+            }
+
+            _ = health_check.tick() => {
+                fetch_ready_sandbox_for_forward(&mut client, name).await?;
+            }
+
+            accepted = listener.accept() => {
+                let (socket, peer) = accepted
+                    .into_diagnostic()
+                    .wrap_err("failed to accept local forward connection")?;
+                let mut client = client.clone();
+                let sandbox_id = sandbox_id.clone();
+                let target_host = target_host.to_string();
+                let service_id = format!("service-forward:{name}:{target_host}:{target_port}");
+                let fatal_tx = fatal_tx.clone();
+                tokio::spawn(async move {
+                    let token = match create_forward_session_token(&mut client, &sandbox_id).await {
+                        Ok(token) => token,
+                        Err(err) => {
+                            tracing::warn!(peer = %peer, error = %err, "service forward session creation failed");
+                            if err.fatal {
+                                let _ = fatal_tx.send(err.message).await;
+                            }
+                            return;
+                        }
+                    };
+                    if let Err(err) = forward_one_tcp_connection(
+                        &mut client,
+                        socket,
+                        sandbox_id,
+                        target_host,
+                        target_port,
+                        service_id,
+                        token.clone(),
+                    )
+                    .await
+                    {
+                        tracing::warn!(peer = %peer, error = %err, "service forward connection failed");
+                        if err.fatal {
+                            let _ = fatal_tx.send(err.message).await;
+                        }
+                    }
+                    let _ = client
+                        .revoke_ssh_session(RevokeSshSessionRequest { token })
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+async fn create_forward_session_token(
+    client: &mut crate::tls::GrpcClient,
+    sandbox_id: &str,
+) -> std::result::Result<String, ForwardTcpConnectionError> {
+    let response = client
+        .create_ssh_session(CreateSshSessionRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .map_err(ForwardTcpConnectionError::from_status)?;
+    Ok(response.into_inner().token)
+}
+
+async fn fetch_ready_sandbox_for_forward(
+    client: &mut crate::tls::GrpcClient,
+    name: &str,
+) -> Result<Sandbox> {
+    let response = match client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+    {
+        Ok(response) => response,
+        Err(status) if status.code() == Code::NotFound => {
+            return Err(miette::miette!(
+                "sandbox '{name}' no longer exists; stopping service forward"
+            ));
+        }
+        Err(status) => return Err(status).into_diagnostic(),
+    };
+
+    let sandbox = response
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox '{name}' not found"))?;
+
+    if SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready) {
+        return Err(miette::miette!(
+            "sandbox '{}' is no longer ready (phase: {}); stopping service forward",
+            name,
+            phase_name(sandbox.phase)
+        ));
+    }
+
+    Ok(sandbox)
+}
+
+#[derive(Debug)]
+struct ForwardTcpConnectionError {
+    message: String,
+    fatal: bool,
+}
+
+impl ForwardTcpConnectionError {
+    fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            fatal: false,
+        }
+    }
+
+    fn from_status(status: Status) -> Self {
+        let fatal = matches!(status.code(), Code::NotFound | Code::FailedPrecondition);
+        Self {
+            message: status.to_string(),
+            fatal,
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardTcpConnectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ForwardTcpConnectionError {}
+
+fn parse_tcp_forward_spec(local: Option<&str>, default_port: u16) -> Result<(String, u16)> {
+    let Some(spec) = local else {
+        return Ok(("127.0.0.1".to_string(), default_port));
+    };
+
+    if let Some(pos) = spec.rfind(':') {
+        let addr = &spec[..pos];
+        let port_str = &spec[pos + 1..];
+        if let Ok(port) = port_str.parse::<u16>() {
+            if addr.is_empty() {
+                return Err(miette::miette!("bind address is required before ':'"));
+            }
+            return Ok((addr.to_string(), port));
+        }
+    }
+
+    let port: u16 = spec.parse().map_err(|_| {
+        miette::miette!("invalid local forward spec '{spec}': expected [bind_address:]port")
+    })?;
+    Ok(("127.0.0.1".to_string(), port))
+}
+
+async fn forward_one_tcp_connection(
+    client: &mut crate::tls::GrpcClient,
+    socket: tokio::net::TcpStream,
+    sandbox_id: String,
+    target_host: String,
+    target_port: u16,
+    service_id: String,
+    authorization_token: String,
+) -> std::result::Result<(), ForwardTcpConnectionError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<TcpForwardFrame>(16);
+    tx.send(TcpForwardFrame {
+        payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Init(
+            TcpForwardInit {
+                sandbox_id,
+                service_id,
+                target: Some(tcp_forward_init::Target::Tcp(TcpRelayTarget {
+                    host: target_host,
+                    port: u32::from(target_port),
+                })),
+                authorization_token,
+            },
+        )),
+    })
+    .await
+    .map_err(|_| ForwardTcpConnectionError::transient("failed to initialize forward stream"))?;
+
+    let mut response = match client.forward_tcp(ReceiverStream::new(rx)).await {
+        Ok(response) => response.into_inner(),
+        Err(status) => {
+            let err = ForwardTcpConnectionError::from_status(status);
+            drain_and_shutdown_local_socket(socket).await;
+            return Err(err);
+        }
+    };
+
+    let (mut local_read, mut local_write) = socket.into_split();
+
+    let to_gateway = tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = local_read.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            if tx
+                .send(TcpForwardFrame {
+                    payload: Some(openshell_core::proto::tcp_forward_frame::Payload::Data(
+                        buf[..n].to_vec(),
+                    )),
+                })
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+        Ok::<(), std::io::Error>(())
+    });
+
+    while let Some(frame) = response
+        .message()
+        .await
+        .map_err(ForwardTcpConnectionError::from_status)?
+    {
+        let Some(openshell_core::proto::tcp_forward_frame::Payload::Data(data)) = frame.payload
+        else {
+            continue;
+        };
+        if data.is_empty() {
+            continue;
+        }
+        local_write
+            .write_all(&data)
+            .await
+            .map_err(|err| ForwardTcpConnectionError::transient(err.to_string()))?;
+    }
+
+    let _ = local_write.shutdown().await;
+    to_gateway.abort();
+    Ok(())
+}
+
+async fn drain_and_shutdown_local_socket(mut socket: tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buf = [0u8; 4096];
+    while matches!(
+        tokio::time::timeout(Duration::from_millis(25), socket.read(&mut buf)).await,
+        Ok(Ok(n)) if n != 0
+    ) {}
+    let _ = socket.shutdown().await;
+}
+
+struct RawModeGuard;
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+struct TaskGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+async fn sandbox_exec_interactive_grpc(
+    mut client: crate::tls::GrpcClient,
+    sandbox: &Sandbox,
+    command: &[String],
+    workdir: Option<&str>,
+    timeout_seconds: u32,
+) -> Result<i32> {
+    use openshell_core::proto::{ExecSandboxInput, ExecSandboxWindowResize, exec_sandbox_input};
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+
+    let (input_tx, input_rx) = tokio::sync::mpsc::channel::<ExecSandboxInput>(4096);
+
+    // Send the start message with exec metadata.
+    input_tx
+        .send(ExecSandboxInput {
+            payload: Some(exec_sandbox_input::Payload::Start(ExecSandboxRequest {
+                sandbox_id: sandbox.object_id().to_string(),
+                command: command.to_vec(),
+                workdir: workdir.unwrap_or_default().to_string(),
+                environment: HashMap::new(),
+                timeout_seconds,
+                stdin: Vec::new(),
+                tty: true,
+                cols: u32::from(cols),
+                rows: u32::from(rows),
+            })),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let mut stream = client
+        .exec_sandbox_interactive(ReceiverStream::new(input_rx))
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    // Enable raw mode so keystrokes are forwarded immediately.
+    crossterm::terminal::enable_raw_mode().into_diagnostic()?;
+    let raw_guard = RawModeGuard;
+
+    // Stdin reader on a detached OS thread. Using std::thread (not
+    // spawn_blocking) so the tokio runtime shutdown doesn't wait for a
+    // thread blocked on stdin.read(). The thread exits when the channel
+    // closes (blocking_send returns Err) or stdin hits EOF.
+    #[cfg(unix)]
+    {
+        let stdin_tx = input_tx.clone();
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 4096];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdin_tx
+                            .blocking_send(ExecSandboxInput {
+                                payload: Some(exec_sandbox_input::Payload::Stdin(
+                                    buf[..n].to_vec(),
+                                )),
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // SIGWINCH handler: forward terminal resize events.
+    #[cfg(unix)]
+    let resize_task = {
+        let resize_tx = input_tx.clone();
+        tokio::spawn(async move {
+            let mut sig =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+                    .expect("failed to register SIGWINCH handler");
+            while sig.recv().await.is_some() {
+                if let Ok((c, r)) = crossterm::terminal::size() {
+                    let msg = ExecSandboxInput {
+                        payload: Some(exec_sandbox_input::Payload::Resize(
+                            ExecSandboxWindowResize {
+                                cols: u32::from(c),
+                                rows: u32::from(r),
+                            },
+                        )),
+                    };
+                    if resize_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        })
+    };
+    #[cfg(unix)]
+    let _resize_guard = TaskGuard(resize_task);
+
+    let mut exit_code = 0i32;
+    let stdout = std::io::stdout();
+
+    while let Some(event) = stream.next().await {
+        let event = event.into_diagnostic()?;
+        match event.payload {
+            Some(exec_sandbox_event::Payload::Stdout(out)) => {
+                let mut handle = stdout.lock();
+                handle.write_all(&out.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Stderr(err)) => {
+                let mut handle = stdout.lock();
+                handle.write_all(&err.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Exit(exit)) => {
+                exit_code = exit.exit_code;
+                break;
+            }
+            None => {}
+        }
+    }
+
+    drop(input_tx);
+
+    // Drop the raw mode guard to restore the terminal before returning.
+    drop(raw_guard);
 
     Ok(exit_code)
 }
@@ -3112,6 +3661,236 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     }
 
     Ok(map)
+}
+
+pub async fn service_expose(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    target_port: u16,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .expose_service(ExposeServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+            target_port: u32::from(target_port),
+            domain: true,
+        })
+        .await
+        .map_err(service_expose_status_error)?
+        .into_inner();
+
+    if service.is_empty() {
+        println!(
+            "{} Exposed sandbox {} -> 127.0.0.1:{}",
+            "✓".green().bold(),
+            sandbox.bold(),
+            target_port,
+        );
+    } else {
+        println!(
+            "{} Exposed service {} on sandbox {} -> 127.0.0.1:{}",
+            "✓".green().bold(),
+            service.bold(),
+            sandbox.bold(),
+            target_port,
+        );
+    }
+    if !response.url.is_empty() {
+        let url = service_url_for_gateway(&response.url, server);
+        println!("  URL: {}", url.cyan());
+    }
+    Ok(())
+}
+
+fn service_expose_status_error(status: Status) -> miette::Report {
+    service_status_error("expose service", "sandbox:write", status)
+}
+
+pub async fn service_list(
+    server: &str,
+    sandbox: Option<&str>,
+    limit: u32,
+    offset: u32,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_services(ListServicesRequest {
+            sandbox: sandbox.unwrap_or_default().to_string(),
+            limit,
+            offset,
+        })
+        .await
+        .map_err(|status| service_status_error("list services", "sandbox:read", status))?
+        .into_inner();
+
+    if response.services.is_empty() {
+        if let Some(sandbox) = sandbox {
+            println!("No services exposed for sandbox {sandbox}.");
+        } else {
+            println!("No services exposed.");
+        }
+        return Ok(());
+    }
+
+    print_service_endpoint_table(&response.services, server);
+    Ok(())
+}
+
+pub async fn service_get(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_service(GetServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+        })
+        .await
+        .map_err(|status| service_status_error("get service", "sandbox:read", status))?
+        .into_inner();
+
+    print_service_endpoint_table(&[response], server);
+    Ok(())
+}
+
+pub async fn service_delete(
+    server: &str,
+    sandbox: &str,
+    service: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .delete_service(DeleteServiceRequest {
+            sandbox: sandbox.to_string(),
+            service: service.to_string(),
+        })
+        .await
+        .map_err(|status| service_status_error("delete service", "sandbox:write", status))?
+        .into_inner();
+
+    if !response.deleted {
+        return Err(miette!("delete service failed: service endpoint not found"));
+    }
+
+    if service.is_empty() {
+        println!(
+            "{} Deleted exposed sandbox {}",
+            "✓".green().bold(),
+            sandbox.bold(),
+        );
+    } else {
+        println!(
+            "{} Deleted service {} on sandbox {}",
+            "✓".green().bold(),
+            service.bold(),
+            sandbox.bold(),
+        );
+    }
+    Ok(())
+}
+
+fn service_status_error(action: &str, required_scope: &str, status: Status) -> miette::Report {
+    let message = status.message();
+    match status.code() {
+        Code::PermissionDenied => {
+            miette!("{action} failed: permission denied (requires {required_scope})")
+        }
+        Code::Unauthenticated => miette!("{action} failed: authentication required"),
+        Code::NotFound if message == "sandbox not found" => {
+            miette!("{action} failed: sandbox not found")
+        }
+        Code::NotFound if message == "service endpoint not found" => {
+            miette!("{action} failed: service endpoint not found")
+        }
+        Code::InvalidArgument if !message.is_empty() => {
+            miette!("{action} failed: invalid request: {message}")
+        }
+        _ => miette!("{action} failed: {status}"),
+    }
+}
+
+fn print_service_endpoint_table(services: &[ServiceEndpointResponse], gateway_endpoint: &str) {
+    let rows = services
+        .iter()
+        .filter_map(|response| {
+            let endpoint = response.endpoint.as_ref()?;
+            let service = service_display_name(&endpoint.service_name).to_string();
+            let target = format!("127.0.0.1:{}", endpoint.target_port);
+            let url = if response.url.is_empty() {
+                String::new()
+            } else {
+                service_url_for_gateway(&response.url, gateway_endpoint)
+            };
+            Some((endpoint.sandbox_name.clone(), service, target, url))
+        })
+        .collect::<Vec<_>>();
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let sandbox_width = rows
+        .iter()
+        .map(|(sandbox, _, _, _)| sandbox.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let service_width = rows
+        .iter()
+        .map(|(_, service, _, _)| service.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let target_width = rows
+        .iter()
+        .map(|(_, _, target, _)| target.len())
+        .max()
+        .unwrap_or(6)
+        .max(6);
+
+    println!(
+        "{:<sandbox_width$}  {:<service_width$}  {:<target_width$}  {}",
+        "SANDBOX".bold(),
+        "SERVICE".bold(),
+        "TARGET".bold(),
+        "URL".bold(),
+    );
+
+    for (sandbox, service, target, url) in rows {
+        println!(
+            "{sandbox:<sandbox_width$}  {service:<service_width$}  {target:<target_width$}  {url}"
+        );
+    }
+}
+
+fn service_display_name(service: &str) -> &str {
+    if service.is_empty() { "-" } else { service }
+}
+
+fn service_url_for_gateway(service_url: &str, gateway_endpoint: &str) -> String {
+    let (Ok(mut service_url), Ok(gateway_endpoint)) = (
+        url::Url::parse(service_url),
+        url::Url::parse(gateway_endpoint),
+    ) else {
+        return service_url.to_string();
+    };
+
+    if service_url
+        .set_port(gateway_endpoint.port_or_known_default())
+        .is_err()
+    {
+        return service_url.to_string();
+    }
+
+    service_url.to_string()
 }
 
 pub async fn provider_create(
@@ -5492,14 +6271,15 @@ fn format_timestamp_ms(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        TlsOptions, dockerfile_sources_supported_for_gateway, format_endpoint,
-        format_gateway_select_header, format_gateway_select_items,
-        format_provider_attachment_table, gateway_add, gateway_auth_label,
-        gateway_env_override_warning, gateway_select_with, gateway_type_label, git_sync_files,
-        http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
+        ProvisioningStep, TlsOptions, build_sandbox_resource_limits,
+        dockerfile_sources_supported_for_gateway, format_endpoint, format_gateway_select_header,
+        format_gateway_select_items, format_provider_attachment_table, gateway_add,
+        gateway_auth_label, gateway_env_override_warning, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, image_requests_gpu, import_local_package_mtls_bundle,
         inferred_provider_type, package_managed_tls_dirs, parse_cli_setting_value,
-        parse_credential_pairs, plaintext_gateway_is_remote, provisioning_timeout_message,
-        ready_false_condition_message, resolve_from, sandbox_should_persist,
+        parse_credential_pairs, plaintext_gateway_is_remote, progress_step_from_metadata,
+        provisioning_timeout_message, ready_false_condition_message, resolve_from,
+        sandbox_should_persist, service_expose_status_error, service_url_for_gateway,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5510,8 +6290,13 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::thread;
+    use tonic::Status;
 
     use openshell_bootstrap::GatewayMetadata;
+    use openshell_core::progress::{
+        PROGRESS_STEP_PULLING_IMAGE, PROGRESS_STEP_REQUESTING_SANDBOX,
+        PROGRESS_STEP_STARTING_SANDBOX,
+    };
     use openshell_core::proto::{
         Provider, SandboxCondition, SandboxStatus, datamodel::v1::ObjectMeta,
     };
@@ -5651,6 +6436,23 @@ mod tests {
         assert!(output.contains('1'));
     }
 
+    #[test]
+    fn progress_step_metadata_values_map_to_cli_steps() {
+        assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_REQUESTING_SANDBOX),
+            Some(ProvisioningStep::RequestingSandbox)
+        );
+        assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_PULLING_IMAGE),
+            Some(ProvisioningStep::PullingSandboxImage)
+        );
+        assert_eq!(
+            progress_step_from_metadata(PROGRESS_STEP_STARTING_SANDBOX),
+            Some(ProvisioningStep::StartingSandbox)
+        );
+        assert_eq!(progress_step_from_metadata("driver-private-step"), None);
+    }
+
     #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_parses_bool_aliases() {
@@ -5692,6 +6494,55 @@ mod tests {
         let err =
             parse_cli_setting_value("unknown_key", "value").expect_err("unknown key should fail");
         assert!(err.to_string().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn build_sandbox_resource_limits_sets_limits_only() {
+        let resources = build_sandbox_resource_limits(Some("500m"), Some("2Gi"))
+            .expect("resource limits should parse")
+            .expect("resource limits should be present");
+
+        let limits = resources
+            .fields
+            .get("limits")
+            .and_then(|value| value.kind.as_ref())
+            .and_then(|kind| match kind {
+                prost_types::value::Kind::StructValue(inner) => Some(inner),
+                _ => None,
+            })
+            .expect("limits should be a struct");
+
+        assert_eq!(
+            limits
+                .fields
+                .get("cpu")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("500m")
+        );
+        assert_eq!(
+            limits
+                .fields
+                .get("memory")
+                .and_then(|value| value.kind.as_ref())
+                .and_then(|kind| match kind {
+                    prost_types::value::Kind::StringValue(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("2Gi")
+        );
+        assert!(!resources.fields.contains_key("requests"));
+    }
+
+    #[test]
+    fn build_sandbox_resource_limits_rejects_invalid_quantities() {
+        assert!(build_sandbox_resource_limits(Some("0"), None).is_err());
+        assert!(build_sandbox_resource_limits(Some("half"), None).is_err());
+        assert!(build_sandbox_resource_limits(None, Some("0Gi")).is_err());
+        assert!(build_sandbox_resource_limits(None, Some("1.5Gi")).is_err());
     }
 
     #[test]
@@ -5870,6 +6721,62 @@ mod tests {
 
         assert!(dockerfile_sources_supported_for_gateway(Some(&metadata)));
         assert!(dockerfile_sources_supported_for_gateway(None));
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_external_gateway_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_omits_default_external_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "https://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "https://quiet-flamingo--openclaw.navigator.openshell.localhost/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_preserves_service_scheme() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://127.0.0.1:31886"
+            ),
+            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:31886/"
+        );
+    }
+
+    #[test]
+    fn service_url_for_gateway_uses_gateway_default_port() {
+        assert_eq!(
+            service_url_for_gateway(
+                "http://quiet-flamingo--openclaw.navigator.openshell.localhost:8080/",
+                "https://gateway.example.com"
+            ),
+            "http://quiet-flamingo--openclaw.navigator.openshell.localhost:443/"
+        );
+    }
+
+    #[test]
+    fn service_expose_status_error_mentions_required_scope() {
+        let report = service_expose_status_error(Status::permission_denied(
+            "scope 'sandbox:write' required",
+        ));
+
+        assert_eq!(
+            report.to_string(),
+            "expose service failed: permission denied (requires sandbox:write)"
+        );
     }
 
     #[test]

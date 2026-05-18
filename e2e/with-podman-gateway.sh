@@ -64,6 +64,7 @@ PODMAN_NETWORK_MANAGED=0
 PODMAN_SERVICE_PID=""
 PODMAN_SERVICE_LOG="${WORKDIR}/podman-service.log"
 PODMAN_SOCKET=""
+GPU_MODE="${OPENSHELL_E2E_PODMAN_GPU:-0}"
 
 # Isolate CLI/SDK gateway metadata from the developer's real config.
 export XDG_CONFIG_HOME="${WORKDIR}/config"
@@ -99,7 +100,6 @@ cleanup() {
       podman_cmd rm -f "${id}" >/dev/null 2>&1 || true
       if [ -n "${sandbox_id}" ] && [ "${sandbox_id}" != "<no value>" ]; then
         podman_cmd volume rm -f "openshell-sandbox-${sandbox_id}-workspace" >/dev/null 2>&1 || true
-        podman_cmd secret rm "openshell-handshake-${sandbox_id}" >/dev/null 2>&1 || true
       fi
     done
   fi
@@ -144,7 +144,12 @@ ensure_e2e_podman_network() {
 default_podman_socket_path() {
   case "$(uname -s)" in
     Darwin)
-      printf '%s\n' "${HOME}/.local/share/containers/podman/machine/podman.sock"
+      # On macOS the podman client talks to a VM; the API socket path is
+      # per-launch (under $TMPDIR) and reported by `podman machine inspect`.
+      # The legacy ~/.local/share/containers/podman/machine/podman.sock path
+      # is not created by podman >= 5.x with the applehv/libkrun providers.
+      podman_cmd machine inspect --format '{{.ConnectionInfo.PodmanSocket.Path}}' 2>/dev/null \
+        | awk 'NF { print; exit }'
       ;;
     Linux)
       if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
@@ -165,11 +170,24 @@ ensure_podman_api_socket() {
   fi
 
   local default_socket
-  if default_socket="$(default_podman_socket_path)" \
+  default_socket="$(default_podman_socket_path || true)"
+  if [ -n "${default_socket}" ] \
      && [ -S "${default_socket}" ] \
      && podman_cmd --url "unix://${default_socket}" info >/dev/null 2>&1; then
     export OPENSHELL_PODMAN_SOCKET="${default_socket}"
     return 0
+  fi
+
+  # `podman system service` is a Linux-only subcommand — the macOS client
+  # delegates the API service to the VM, so we can't spin one up locally.
+  # If we got here on Darwin, the user's `podman machine` is either not
+  # running or its socket isn't reachable; surface that directly.
+  if [ "$(uname -s)" = "Darwin" ]; then
+    echo "ERROR: could not reach the Podman API socket on macOS." >&2
+    echo "       Expected socket from 'podman machine inspect': ${default_socket:-<none>}" >&2
+    echo "       Ensure 'podman machine start' has been run, or set" >&2
+    echo "       OPENSHELL_PODMAN_SOCKET to a reachable unix socket path." >&2
+    exit 2
   fi
 
   PODMAN_SOCKET="${WORKDIR}/podman/podman.sock"
@@ -315,7 +333,6 @@ HEALTH_PORT=$(e2e_pick_port)
 STATE_DIR="${WORKDIR}/state"
 mkdir -p "${STATE_DIR}"
 
-HANDSHAKE_SECRET="e2e-podman-$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 E2E_NAMESPACE="e2e-podman-$$-${HOST_PORT}"
 PODMAN_NETWORK_NAME="${E2E_NAMESPACE}"
 ensure_e2e_podman_network "${PODMAN_NETWORK_NAME}"
@@ -326,17 +343,47 @@ export OPENSHELL_E2E_NETWORK_NAME="${PODMAN_NETWORK_NAME}"
 export OPENSHELL_E2E_SANDBOX_NAMESPACE="${E2E_NAMESPACE}"
 
 echo "Starting openshell-gateway on port ${HOST_PORT} (namespace: ${E2E_NAMESPACE})..."
+
+# Driver-specific options moved from CLI flags into a TOML config table
+# (commit 560550d2). Synthesize a minimal config here and pass --config.
+# Quote a value as a TOML basic string: see with-docker-gateway.sh for
+# the same helper (kept duplicated to avoid sourcing across e2e scripts).
+toml_string() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '"%s"' "${value}"
+}
+
+GATEWAY_CONFIG="${STATE_DIR}/gateway.toml"
+{
+  printf '[openshell]\nversion = 1\n\n'
+  printf '[openshell.gateway]\nlog_level = "info"\n\n'
+  printf '[openshell.drivers.podman]\n'
+  # The Podman driver scopes isolation by network rather than namespace.
+  printf 'network_name = %s\n'   "$(toml_string "${PODMAN_NETWORK_NAME}")"
+  printf 'gateway_port = %s\n'   "${HOST_PORT}"
+  printf 'default_image = %s\n'  "$(toml_string "${SANDBOX_IMAGE}")"
+  printf 'image_pull_policy = "missing"\n'
+  printf 'supervisor_image = %s\n' "$(toml_string "${SUPERVISOR_IMAGE}")"
+  # The in-process Podman driver reads `socket_path` from TOML only — the
+  # OPENSHELL_PODMAN_SOCKET env var is honoured by the standalone driver
+  # binary, not the in-process driver used here. Pin the socket to the one
+  # the harness discovered (e.g. via `podman machine inspect` on macOS) so
+  # we don't fall back to the driver's stale macOS default.
+  if [ -n "${OPENSHELL_PODMAN_SOCKET:-}" ]; then
+    printf 'socket_path = %s\n' "$(toml_string "${OPENSHELL_PODMAN_SOCKET}")"
+  fi
+} > "${GATEWAY_CONFIG}"
+
 GATEWAY_ARGS=(
+  --config "${GATEWAY_CONFIG}"
   --bind-address 0.0.0.0
   --port "${HOST_PORT}"
   --health-port "${HEALTH_PORT}"
-  --ssh-gateway-port "${HOST_PORT}"
   --drivers podman
   --disable-tls
   --db-url "sqlite:${STATE_DIR}/gateway.db?mode=rwc"
-  --sandbox-namespace "${E2E_NAMESPACE}"
-  --sandbox-image "${SANDBOX_IMAGE}"
-  --sandbox-image-pull-policy missing
   --log-level info
 )
 
@@ -347,7 +394,6 @@ e2e_export_gateway_restart_metadata \
   "${GATEWAY_LOG}" \
   "${GATEWAY_PID_FILE}"
 
-OPENSHELL_SSH_HANDSHAKE_SECRET="${HANDSHAKE_SECRET}" \
 OPENSHELL_SUPERVISOR_IMAGE="${SUPERVISOR_IMAGE}" \
 OPENSHELL_NETWORK_NAME="${PODMAN_NETWORK_NAME}" \
   "${GATEWAY_BIN}" "${GATEWAY_ARGS[@]}" >"${GATEWAY_LOG}" 2>&1 &

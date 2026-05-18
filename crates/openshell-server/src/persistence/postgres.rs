@@ -48,7 +48,7 @@ impl PostgresStore {
         payload: &[u8],
         labels: Option<&str>,
     ) -> PersistenceResult<()> {
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
         let labels_jsonb: Option<serde_json::Value> = labels
             .map(serde_json::from_str)
             .transpose()
@@ -205,7 +205,7 @@ LIMIT $3 OFFSET $4
         payload: &[u8],
         hash: &str,
     ) -> PersistenceResult<()> {
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
         let record = PolicyRecord {
             id: id.to_string(),
             sandbox_id: sandbox_id.to_string(),
@@ -348,7 +348,7 @@ LIMIT $3 OFFSET $4
         record.load_error = load_error.map(ToOwned::to_owned);
         record.loaded_at_ms = loaded_at_ms;
         let payload = policy_payload_from_record(&record)?;
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
 
         let result = sqlx::query(
             r"
@@ -374,7 +374,7 @@ WHERE object_type = $1 AND scope = $2 AND version = $3
         sandbox_id: &str,
         before_version: i64,
     ) -> PersistenceResult<u64> {
-        let now_ms = current_time_ms()?;
+        let now_ms = current_time_ms();
         let result = sqlx::query(
             r"
 UPDATE objects
@@ -395,9 +395,16 @@ WHERE object_type = $1
         Ok(result.rows_affected())
     }
 
-    pub async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> PersistenceResult<()> {
+    pub async fn put_draft_chunk(
+        &self,
+        chunk: &DraftChunkRecord,
+        dedup_key: Option<&str>,
+    ) -> PersistenceResult<String> {
         let payload = draft_chunk_payload_from_record(chunk)?;
-        sqlx::query(
+        // RETURNING id gives the row's effective id whether INSERT inserted
+        // a fresh row or ON CONFLICT updated an existing one. See the
+        // matching sqlite path for the rationale.
+        let row = sqlx::query(
             r"
 INSERT INTO objects (
     object_type, id, scope, status, dedup_key, hit_count, payload, created_at_ms, updated_at_ms
@@ -406,21 +413,22 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 ON CONFLICT (object_type, scope, dedup_key) WHERE dedup_key IS NOT NULL DO UPDATE SET
     hit_count = objects.hit_count + EXCLUDED.hit_count,
     updated_at_ms = EXCLUDED.updated_at_ms
+RETURNING id
 ",
         )
         .bind(DRAFT_CHUNK_OBJECT_TYPE)
         .bind(&chunk.id)
         .bind(&chunk.sandbox_id)
         .bind(&chunk.status)
-        .bind(draft_chunk_dedup_key(chunk))
+        .bind(dedup_key)
         .bind(i64::from(chunk.hit_count))
         .bind(payload)
         .bind(chunk.first_seen_ms)
         .bind(chunk.last_seen_ms)
-        .execute(&self.pool)
+        .fetch_one(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
-        Ok(())
+        Ok(row.get::<String, _>("id"))
     }
 
     pub async fn get_draft_chunk(&self, id: &str) -> PersistenceResult<Option<DraftChunkRecord>> {
@@ -483,6 +491,7 @@ ORDER BY created_at_ms DESC
         id: &str,
         status: &str,
         decided_at_ms: Option<i64>,
+        rejection_reason: Option<&str>,
     ) -> PersistenceResult<bool> {
         let Some(mut record) = self.get_draft_chunk(id).await? else {
             return Ok(false);
@@ -490,7 +499,10 @@ ORDER BY created_at_ms DESC
 
         record.status = status.to_string();
         record.decided_at_ms = decided_at_ms;
-        record.last_seen_ms = current_time_ms()?;
+        record.last_seen_ms = current_time_ms();
+        if let Some(reason) = rejection_reason {
+            record.rejection_reason = reason.to_string();
+        }
         let payload = draft_chunk_payload_from_record(&record)?;
 
         let result = sqlx::query(
@@ -525,7 +537,7 @@ WHERE object_type = $1 AND id = $2
         }
 
         record.proposed_rule = proposed_rule.to_vec();
-        record.last_seen_ms = current_time_ms()?;
+        record.last_seen_ms = current_time_ms();
         let payload = draft_chunk_payload_from_record(&record)?;
 
         let result = sqlx::query(
@@ -595,10 +607,6 @@ WHERE object_type = $1 AND scope = $2
         }
         Ok(max_version)
     }
-}
-
-fn draft_chunk_dedup_key(chunk: &DraftChunkRecord) -> String {
-    format!("{}|{}|{}", chunk.host, chunk.port, chunk.binary)
 }
 
 fn row_to_object_record(row: sqlx::postgres::PgRow) -> ObjectRecord {

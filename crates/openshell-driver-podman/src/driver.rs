@@ -199,6 +199,10 @@ impl PodmanComputeDriver {
         sandbox: &DriverSandbox,
     ) -> Result<(), ComputeDriverError> {
         let gpu_requested = sandbox.spec.as_ref().is_some_and(|s| s.gpu);
+        Self::validate_gpu_request(gpu_requested)
+    }
+
+    fn validate_gpu_request(gpu_requested: bool) -> Result<(), ComputeDriverError> {
         if gpu_requested && !Self::has_gpu_capacity() {
             return Err(ComputeDriverError::Precondition(
                 "GPU sandbox requested, but no NVIDIA GPU devices are available.".to_string(),
@@ -221,12 +225,11 @@ impl PodmanComputeDriver {
         }
 
         // Validate the composed container name early, before creating any
-        // resources (secret, volume), so we don't leave orphans when the
-        // name is invalid.
+        // resources (volume), so we don't leave orphans when the name is
+        // invalid.
         let name = validated_container_name(&sandbox.name)?;
 
         let vol_name = container::volume_name(&sandbox.id);
-        let sec_name = container::secret_name(&sandbox.id);
 
         info!(
             sandbox_id = %sandbox.id,
@@ -253,7 +256,7 @@ impl PodmanComputeDriver {
         let image = container::resolve_image(sandbox, &self.config);
         if image.is_empty() {
             return Err(ComputeDriverError::Precondition(
-                "no sandbox image configured: set --sandbox-image on the server \
+                "no sandbox image configured: set default_image in [openshell.drivers.podman] \
                  or provide an image in the sandbox template"
                     .to_string(),
             ));
@@ -265,35 +268,25 @@ impl PodmanComputeDriver {
             .await
             .map_err(ComputeDriverError::from)?;
 
-        // 2. Create the SSH handshake secret via the Podman secrets API
-        //    so it is not exposed in `podman inspect` output.
-        self.client
-            .create_secret(&sec_name, self.config.ssh_handshake_secret.as_bytes())
-            .await
-            .map_err(ComputeDriverError::from)?;
-
-        // 3. Create workspace volume.
+        // 2. Create workspace volume.
         if let Err(e) = self.client.create_volume(&vol_name).await {
-            let _ = self.client.remove_secret(&sec_name).await;
             return Err(ComputeDriverError::from(e));
         }
 
-        // 4. Create container.
+        // 3. Create container.
         let spec = container::build_container_spec(sandbox, &self.config);
         match self.client.create_container(&spec).await {
             Ok(_) => {}
             Err(PodmanApiError::Conflict(_)) => {
-                // Clean up the volume and secret we just created. They are
-                // keyed by *this* sandbox's ID, not the conflicting
-                // container's ID (which has the same name but a different
-                // ID), so they would be orphaned otherwise.
+                // Clean up the volume we just created. It is keyed by *this*
+                // sandbox's ID, not the conflicting container's ID (which
+                // has the same name but a different ID), so it would be
+                // orphaned otherwise.
                 let _ = self.client.remove_volume(&vol_name).await;
-                let _ = self.client.remove_secret(&sec_name).await;
                 return Err(ComputeDriverError::AlreadyExists);
             }
             Err(e) => {
                 let _ = self.client.remove_volume(&vol_name).await;
-                let _ = self.client.remove_secret(&sec_name).await;
                 return Err(ComputeDriverError::from(e));
             }
         }
@@ -307,7 +300,6 @@ impl PodmanComputeDriver {
             );
             let _ = self.client.remove_container(&name).await;
             let _ = self.client.remove_volume(&vol_name).await;
-            let _ = self.client.remove_secret(&sec_name).await;
             return Err(ComputeDriverError::from(e));
         }
 
@@ -386,15 +378,15 @@ impl PodmanComputeDriver {
             .await;
 
         // Remove container. If NotFound, the container was removed between
-        // inspect and here (TOCTOU race); proceed with volume/secret cleanup
-        // since those resources are idempotent to remove.
+        // inspect and here (TOCTOU race); proceed with volume cleanup
+        // since the workspace volume is idempotent to remove.
         let container_existed = match self.client.remove_container(&name).await {
             Ok(()) => true,
             Err(PodmanApiError::NotFound(_)) => false,
             Err(e) => return Err(ComputeDriverError::from(e)),
         };
 
-        // Remove workspace volume and handshake secret.
+        // Remove workspace volume.
         let vol = container::volume_name(sandbox_id);
         if let Err(e) = self.client.remove_volume(&vol).await {
             warn!(
@@ -403,16 +395,6 @@ impl PodmanComputeDriver {
                 volume = %vol,
                 error = %e,
                 "Failed to remove workspace volume"
-            );
-        }
-        let sec = container::secret_name(sandbox_id);
-        if let Err(e) = self.client.remove_secret(&sec).await {
-            warn!(
-                sandbox_id = %sandbox_id,
-                sandbox_name = %sandbox_name,
-                secret = %sec,
-                error = %e,
-                "Failed to remove handshake secret"
             );
         }
 
@@ -753,14 +735,12 @@ mod tests {
         let sandbox_name = "demo";
         let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
-        let secret_name = container::secret_name(sandbox_id);
         let (socket_path, request_log, handle) = spawn_podman_stub(
             "delete-not-found",
             vec![
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
                 StubResponse::new(StatusCode::NOT_FOUND, r#"{"message":"gone"}"#),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
@@ -800,10 +780,6 @@ mod tests {
                     "DELETE {}",
                     api_path(&format!("/libpod/volumes/{volume_name}"))
                 ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/secrets/{secret_name}"))
-                ),
             ]
         );
         let _ = std::fs::remove_file(socket_path);
@@ -815,7 +791,6 @@ mod tests {
         let sandbox_name = "demo";
         let container_name = container::container_name(sandbox_name);
         let volume_name = container::volume_name(sandbox_id);
-        let secret_name = container::secret_name(sandbox_id);
         let inspect_body = serde_json::json!({
             "Id": "container-id",
             "Name": format!("/{container_name}"),
@@ -837,7 +812,6 @@ mod tests {
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
                 StubResponse::new(StatusCode::NO_CONTENT, ""),
-                StubResponse::new(StatusCode::NO_CONTENT, ""),
             ],
         );
         let driver = test_driver(socket_path.clone());
@@ -855,16 +829,10 @@ mod tests {
             .clone();
         assert_eq!(
             requests[3..],
-            [
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/volumes/{volume_name}"))
-                ),
-                format!(
-                    "DELETE {}",
-                    api_path(&format!("/libpod/secrets/{secret_name}"))
-                ),
-            ]
+            [format!(
+                "DELETE {}",
+                api_path(&format!("/libpod/volumes/{volume_name}"))
+            )]
         );
         let _ = std::fs::remove_file(socket_path);
     }

@@ -72,7 +72,11 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
 
 **--tls-client-ca** *PATH*
 :   Path to CA certificate for client certificate verification (mTLS).
-    Required unless **--disable-tls** is set.
+    When set without **--oidc-issuer**, client certificates are required
+    and the TLS handshake rejects unauthenticated connections. When set
+    together with **--oidc-issuer**, client certificates are accepted
+    but not required — callers may authenticate with either a Bearer
+    token or a client certificate.
     Environment: **OPENSHELL_TLS_CLIENT_CA**.
 
 **--disable-tls**
@@ -83,40 +87,16 @@ gRPC and HTTP, secured by mutual TLS (mTLS) by default.
     **--bind-address** to **127.0.0.1**.
     Environment: **OPENSHELL_DISABLE_TLS**.
 
-**--disable-gateway-auth**
-:   Disable mTLS client certificate requirement. The TLS handshake
-    accepts connections without a client certificate. Ignored when
-    **--disable-tls** is set.
-    Environment: **OPENSHELL_DISABLE_GATEWAY_AUTH**.
+**--server-san** *SAN*
+:   Subject Alternative Name configured on the gateway server
+    certificate. Repeat or pass a comma-separated value through
+    **OPENSHELL_SERVER_SAN**. Wildcard DNS SANs also enable sandbox
+    service URLs under that domain.
+    Environment: **OPENSHELL_SERVER_SAN**.
 
-**--sandbox-image** *IMAGE*
-:   Default container image for sandboxes.
-    Environment: **OPENSHELL_SANDBOX_IMAGE**.
-
-**--sandbox-image-pull-policy** *POLICY*
-:   Image pull policy: Always, IfNotPresent, Never.
-    Environment: **OPENSHELL_SANDBOX_IMAGE_PULL_POLICY**.
-
-**--ssh-handshake-secret** *SECRET*
-:   Shared secret for gateway-to-sandbox SSH handshake.
-    Environment: **OPENSHELL_SSH_HANDSHAKE_SECRET**.
-
-**--ssh-handshake-skew-secs** *SECONDS*
-:   Allowed clock skew in seconds for SSH handshake. Default: **30**.
-    Environment: **OPENSHELL_SSH_HANDSHAKE_SKEW_SECS**.
-
-**--ssh-gateway-host** *HOST*
-:   Public host for the SSH gateway endpoint. Default: **127.0.0.1**.
-    Environment: **OPENSHELL_SSH_GATEWAY_HOST**.
-
-**--ssh-gateway-port** *PORT*
-:   Public port for the SSH gateway endpoint. Default: **8080**.
-    Environment: **OPENSHELL_SSH_GATEWAY_PORT**.
-
-**--grpc-endpoint** *URL*
-:   gRPC endpoint for sandbox callbacks. Should be reachable from
-    within sandbox containers.
-    Environment: **OPENSHELL_GRPC_ENDPOINT**.
+Compute driver settings such as sandbox image, callback endpoint, image
+pull policy, network name, VM state directory, and guest TLS material are
+configured in the TOML file passed with **--config**.
 
 # SYSTEMD INTEGRATION
 
@@ -138,7 +118,7 @@ The unit runs two **ExecStartPre** scripts on first start:
 
 1. **init-pki.sh** generates a self-signed PKI bundle for mTLS.
 2. **init-gateway-env.sh** generates the environment configuration
-   file with an auto-generated SSH handshake secret.
+   file.
 
 Both scripts are idempotent and skip generation if their output files
 already exist.

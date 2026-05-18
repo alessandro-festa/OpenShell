@@ -40,14 +40,14 @@ use hyper_util::{
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
-    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    ExecSandboxEvent, ExecSandboxInput, ExecSandboxRequest, GatewayMessage,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
     GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
-    WatchSandboxRequest,
+    ProviderResponse, RelayFrame, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage, TcpForwardFrame,
+    UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -164,6 +164,36 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(CreateSshSessionResponse::default()))
     }
 
+    async fn expose_service(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ExposeServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ServiceEndpointResponse::default(),
+        ))
+    }
+
+    async fn get_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::ServiceEndpointResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn list_services(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListServicesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListServicesResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
+    async fn delete_service(
+        &self,
+        _: tonic::Request<openshell_core::proto::DeleteServiceRequest>,
+    ) -> Result<Response<openshell_core::proto::DeleteServiceResponse>, Status> {
+        Err(Status::unimplemented("unused"))
+    }
+
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
@@ -259,6 +289,14 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<Self::ExecSandboxStream>, Status> {
         let (_tx, rx) = mpsc::channel(1);
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type ExecSandboxInteractiveStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    async fn exec_sandbox_interactive(
+        &self,
+        _request: tonic::Request<tonic::Streaming<ExecSandboxInput>>,
+    ) -> Result<Response<Self::ExecSandboxInteractiveStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
     }
 
     async fn update_config(
@@ -373,12 +411,22 @@ impl OpenShell for TestOpenShell {
         Err(Status::unimplemented("not implemented in test"))
     }
 
-    type RelayStreamStream = ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
+    type RelayStreamStream = ReceiverStream<Result<RelayFrame, Status>>;
 
     async fn relay_stream(
         &self,
-        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+        _request: tonic::Request<tonic::Streaming<RelayFrame>>,
     ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type ForwardTcpStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<TcpForwardFrame, Status>> + Send>>;
+
+    async fn forward_tcp(
+        &self,
+        _request: tonic::Request<tonic::Streaming<TcpForwardFrame>>,
+    ) -> Result<Response<Self::ForwardTcpStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 }
